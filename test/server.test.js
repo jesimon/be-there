@@ -2,9 +2,17 @@
 // answering, passing signals, and ending. Then the relay: who may ask for it,
 // who is told, and that its credentials stop working when the visit ends.
 // The relay is always a fake here: nothing in these tests talks to Cloudflare.
+// Last, the new address: which one is accepted, and that both are served alike.
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
+import { spawn } from 'node:child_process';
+import fs from 'node:fs';
+import http from 'node:http';
+import net from 'node:net';
+import os from 'node:os';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import WebSocket from 'ws';
 import { startServer, createApp } from '../server.js';
 import { createStore } from '../lib/store.js';
@@ -68,7 +76,7 @@ test('pages are private and carry safe headers', async () => {
 });
 
 test('pages, scripts and styles are checked with the server every time', async () => {
-  for (const file of ['/', '/home', '/visit', '/organize', '/setup', '/setup.html', '/js/common.js', '/js/peer.js', '/js/home.js', '/js/visit.js', '/js/organize.js', '/css/style.css']) {
+  for (const file of ['/', '/home', '/visit', '/organize', '/setup', '/setup.html', '/js/common.js', '/js/peer.js', '/js/moved.js', '/js/home.js', '/js/visit.js', '/js/organize.js', '/js/setup.js', '/css/style.css']) {
     const r = await fetch(srv.url + file);
     assert.equal(r.status, 200, file);
     assert.equal(r.headers.get('cache-control'), 'no-cache', file);
@@ -79,7 +87,8 @@ test('pages, scripts and styles are checked with the server every time', async (
 
 test('/api/config keeps its shape for pages that are already open, and lists STUN only', async () => {
   const config = (await req('/api/config')).body;
-  assert.deepEqual(config, { iceServers: [{ urls: 'stun:stun.cloudflare.com:3478' }], dropInNoticeSeconds: 8 });
+  // canonicalOrigin was added with the new address; null means there is none.
+  assert.deepEqual(config, { iceServers: [{ urls: 'stun:stun.cloudflare.com:3478' }], dropInNoticeSeconds: 8, canonicalOrigin: null });
 
   // Even if someone puts a relay and its password in ICE_SERVERS.
   const env = { ICE_SERVERS: JSON.stringify([{ urls: 'stun:stun.example.org:3478' }, { urls: 'turn:relay.example.org:3478', username: 'SECRET-USER', credential: 'SECRET-PASSWORD' }]) };
@@ -510,7 +519,7 @@ test('relay: credentials never appear in anything served outside the visit', asy
   assert.doesNotMatch((await w.req('/api/visit', { token: v.people[0].token })).text, secret);
   assert.doesNotMatch(JSON.stringify(v.people[1].socket.seen), secret);
   // /api/config still says what it always said.
-  assert.deepEqual((await w.req('/api/config')).body, { iceServers: [{ urls: 'stun:stun.cloudflare.com:3478' }], dropInNoticeSeconds: 8 });
+  assert.deepEqual((await w.req('/api/config')).body, { iceServers: [{ urls: 'stun:stun.cloudflare.com:3478' }], dropInNoticeSeconds: 8, canonicalOrigin: null });
 });
 
 test('the organizer sees whether the relay is set up, and can test it', async (t) => {
@@ -741,4 +750,272 @@ test('relay: failed attempts count towards the limit too', async () => {
   assert.equal(s.relay.asked.length, 4);
   assert.equal(s.relays().length, 6);
   assert.ok(s.relays().every(([who, m]) => who === 'visitor' && m.iceServers === null && m.reason === 'unavailable'));
+});
+
+// ---------------------------------------------------------------------------
+// The new address
+// ---------------------------------------------------------------------------
+
+const NEW_ADDRESS = 'https://bethere.gladspring.org';
+
+// One request with headers of our own choosing, Host included, that follows
+// no redirect.
+function raw(server, pathname, headers = {}) {
+  const { port } = new URL(server.url);
+  return new Promise((resolve, reject) => {
+    const request = http.request({ host: '127.0.0.1', port, path: pathname, method: 'GET', headers }, (res) => {
+      let text = '';
+      res.setEncoding('utf8');
+      res.on('data', (chunk) => { text += chunk; });
+      res.on('end', () => resolve({ status: res.statusCode, headers: res.headers, text }));
+    });
+    request.on('error', reject);
+    request.end();
+  });
+}
+
+// What a server started with these options says its new address is.
+async function addressWith(options) {
+  const server = await startServer({ port: 0, store: createStore(':memory:'), setupPassword: '', env: {}, relay: fakeRelay(), ...options });
+  try {
+    const res = await reqOn(server)('/api/config');
+    assert.equal(res.status, 200);
+    // What pages already open rely on is still there, whatever the address.
+    assert.deepEqual(res.body.iceServers, [{ urls: 'stun:stun.cloudflare.com:3478' }]);
+    assert.equal(res.body.dropInNoticeSeconds, 8);
+    assert.deepEqual(Object.keys(res.body).sort(), ['canonicalOrigin', 'dropInNoticeSeconds', 'iceServers']);
+    assert.equal(server.canonicalOrigin, res.body.canonicalOrigin);
+    return { origin: res.body.canonicalOrigin, ignored: server.canonicalIgnored, text: res.text };
+  } finally {
+    await server.close();
+  }
+}
+
+test('the new address: there is none until it is switched on', async () => {
+  assert.equal((await req('/api/config')).body.canonicalOrigin, null);
+  assert.deepEqual(await addressWith({}), { origin: null, ignored: false, text: JSON.stringify({ iceServers: [{ urls: 'stun:stun.cloudflare.com:3478' }], dropInNoticeSeconds: 8, canonicalOrigin: null }) });
+  for (const empty of ['', '  ']) {
+    const found = await addressWith({ env: { CANONICAL_ORIGIN: empty } });
+    assert.equal(found.origin, null);
+    assert.equal(found.ignored, false);
+  }
+});
+
+test('the new address: named when CANONICAL_ORIGIN is the one built into the code', async () => {
+  const found = await addressWith({ env: { CANONICAL_ORIGIN: NEW_ADDRESS } });
+  assert.equal(found.origin, NEW_ADDRESS);
+  assert.equal(found.ignored, false);
+  // A stray space or line end from pasting it into the host's settings is forgiven.
+  assert.equal((await addressWith({ env: { CANONICAL_ORIGIN: ` ${NEW_ADDRESS}\n` } })).origin, NEW_ADDRESS);
+});
+
+test('the new address: any other value is ignored, look-alikes included', async () => {
+  const others = [
+    'https://bethere.gladspring.org.evil.example',
+    'http://bethere.gladspring.org',
+    'https://bethere.gladspring.org/',
+    'https://bethere.gladspring.org/visit',
+    'https://bethere.gladspring.org/#x',
+    'https://bethere.gladspring.org:8443',
+    'https://BeThere.gladspring.org',
+    'https://bethere.gladspring.org@evil.example',
+    'https://evil.example/?https://bethere.gladspring.org',
+    'bethere.gladspring.org',
+    'https://be-there-gp50.onrender.com',
+    'https://evil.example',
+    'http://127.0.0.1:3000',
+  ];
+  for (const value of others) {
+    const found = await addressWith({ env: { CANONICAL_ORIGIN: value } });
+    assert.equal(found.origin, null, value);
+    assert.equal(found.ignored, true, value);
+    assert.doesNotMatch(found.text, /evil|8443|onrender|127\.0\.0\.1/, 'the value is not passed on to pages');
+  }
+  // The list is in the code. Nothing in the settings can add to it.
+  const local = 'http://127.0.0.1:3000';
+  const tried = await addressWith({ env: { CANONICAL_ORIGIN: local, CANONICAL_ALLOW: local, CANONICAL_ORIGINS: local, CANONICAL_ALLOW_LIST: JSON.stringify([local]) } });
+  assert.equal(tried.origin, null);
+  assert.equal(tried.ignored, true);
+});
+
+test('the new address: a test may use an address on this machine, with a list of its own', async () => {
+  const local = 'http://127.0.0.1:45678';
+  assert.equal((await addressWith({ canonicalOrigin: local, canonicalAllow: [local] })).origin, local);
+  // Without its own list, the built-in one applies.
+  assert.deepEqual({ ...(await addressWith({ canonicalOrigin: local })), text: '' }, { origin: null, ignored: true, text: '' });
+  assert.equal((await addressWith({ canonicalOrigin: NEW_ADDRESS })).origin, NEW_ADDRESS);
+  // The list alone switches nothing on.
+  assert.equal((await addressWith({ canonicalAllow: [local] })).origin, null);
+  // A look-alike of the local one is still ignored.
+  assert.equal((await addressWith({ canonicalOrigin: 'http://127.0.0.1:45679', canonicalAllow: [local] })).origin, null);
+});
+
+test('both addresses are served alike: 200 for either Host, and never a redirect', async (t) => {
+  // With the new address switched on, and with it off.
+  for (const env of [{ CANONICAL_ORIGIN: NEW_ADDRESS }, {}]) {
+    const server = await startServer({ port: 0, store: createStore(':memory:'), setupPassword: '', env, relay: fakeRelay() });
+    t.after(() => server.close());
+    const { port } = new URL(server.url);
+    const hosts = [
+      { Host: 'be-there-gp50.onrender.com' },
+      { Host: 'bethere.gladspring.org' },
+      // As the host's proxy passes requests on.
+      { Host: 'be-there-gp50.onrender.com', 'X-Forwarded-Host': 'be-there-gp50.onrender.com', 'X-Forwarded-Proto': 'https' },
+      { Host: 'bethere.gladspring.org', 'X-Forwarded-Host': 'bethere.gladspring.org', 'X-Forwarded-Proto': 'https' },
+      { Host: `127.0.0.1:${port}`, 'X-Forwarded-Host': 'bethere.gladspring.org', 'X-Forwarded-Proto': 'http' },
+      { Host: 'some-other-name.example' },
+    ];
+    const paths = ['/healthz', '/', '/home', '/visit', '/organize', '/setup', '/visit?relay=1', '/api/config', '/api/setup-info',
+      '/js/moved.js', '/js/common.js', '/js/home.js', '/js/visit.js', '/js/organize.js', '/js/setup.js', '/js/peer.js', '/css/style.css', '/favicon.svg'];
+    for (const pathname of paths) {
+      let first = null;
+      for (const headers of hosts) {
+        const res = await raw(server, pathname, headers);
+        const where = `${pathname} as ${headers.Host}`;
+        assert.equal(res.status, 200, where);
+        assert.equal(res.headers.location, undefined, where);
+        first ??= res.text;
+        assert.equal(res.text, first, `${where}: the same answer at every address`);
+      }
+    }
+    // What does not exist is a plain 404 at either address, not a redirect.
+    for (const headers of hosts) {
+      const missing = await raw(server, '/no-such-page', headers);
+      assert.equal(missing.status, 404);
+      assert.equal(missing.headers.location, undefined);
+    }
+  }
+});
+
+test('links, visits and the live connection work the same through either address', async (t) => {
+  const w = await world(t);
+  const { home, homeToken, organizerToken } = w.store.createHome({ personName: 'Mary', hours: { start: '00:00', end: '00:00' } });
+  const { visitor, token } = w.store.addVisitor(home, { name: 'Sarah' });
+  w.store.updateVisitor(home, visitor.id, { approved: true });
+  const OLD = 'be-there-gp50.onrender.com';
+  const NEW = 'bethere.gladspring.org';
+  for (const Host of [OLD, NEW]) {
+    const organize = await raw(w.server, '/api/organize', { Host, Authorization: `Bearer ${organizerToken}` });
+    assert.equal(organize.status, 200, Host);
+    assert.equal(JSON.parse(organize.text).home.personName, 'Mary');
+    assert.equal((await raw(w.server, '/api/visit', { Host, Authorization: `Bearer ${token}` })).status, 200, Host);
+  }
+
+  // A live connection to /ws by either name, as a browser at either address
+  // makes it. The home screen stays at the old address; the visitor is at the
+  // new one. They still meet: it is one server.
+  const join = (Host, role, secret) => {
+    const ws = new WebSocket(w.server.url.replace('http', 'ws') + '/ws', { headers: { Host }, origin: `https://${Host}` });
+    const seen = [];
+    ws.on('message', (data) => seen.push(JSON.parse(data.toString())));
+    ws.on('open', () => ws.send(JSON.stringify({ type: 'hello', role, token: secret, timeZone: 'UTC' })));
+    t.after(() => ws.terminate());
+    const got = (type) => until(() => seen.some((m) => m.type === type), `${type} at ${Host}`).then(() => seen.find((m) => m.type === type));
+    return { ws, seen, got, send: (m) => ws.send(JSON.stringify(m)) };
+  };
+  const homeScreen = join(OLD, 'home', homeToken);
+  await homeScreen.got('state');
+  const sarah = join(NEW, 'visitor', token);
+  await until(() => sarah.seen.some((m) => m.type === 'status' && m.view.canVisit), 'Sarah to be able to visit');
+  sarah.send({ type: 'knock' });
+  assert.equal((await homeScreen.got('knock')).name, 'Sarah');
+  homeScreen.send({ type: 'answer', visitorId: visitor.id });
+  await sarah.got('answered');
+  sarah.send({ type: 'signal', data: { hello: 1 } });
+  assert.deepEqual((await homeScreen.got('signal')).data, { hello: 1 });
+  homeScreen.send({ type: 'end' });
+  assert.equal((await sarah.got('ended')).reason, 'ended');
+});
+
+test('a page checking the new address opens /ws and says nothing: nothing happens, nothing is logged', async (t) => {
+  const written = [];
+  for (const method of ['log', 'info', 'warn', 'error', 'debug']) t.mock.method(console, method, (...args) => written.push(args));
+  const w = await world(t);
+  const h = await w.household();
+  // The check a page at the old address makes before it moves: from another
+  // address, open, wait, close. No hello, no link.
+  for (let i = 0; i < 3; i += 1) {
+    const ws = new WebSocket(w.server.url.replace('http', 'ws') + '/ws', { headers: { Host: 'bethere.gladspring.org' }, origin: 'https://be-there-gp50.onrender.com' });
+    const received = [];
+    ws.on('message', (data) => received.push(data.toString()));
+    await new Promise((resolve, reject) => { ws.on('open', resolve); ws.on('error', reject); });
+    ws.close();
+    await new Promise((resolve) => ws.on('close', resolve));
+    assert.deepEqual(received, [], 'the server tells it nothing');
+  }
+  // The home and its visitor heard nothing of it, and visits go on as before.
+  h.sarah.send({ type: 'knock' });
+  await h.homeScreen.next('knock');
+  await h.sarah.next('ringing');
+  assert.deepEqual(h.homeScreen.seen.map((m) => m.type).filter((type) => type !== 'state'), ['knock']);
+  assert.deepEqual(h.sarah.seen.map((m) => m.type).filter((type) => type !== 'status'), ['ringing']);
+  await w.close();
+  assert.deepEqual(written, []);
+});
+
+test('over HTTPS, browsers are told to keep to HTTPS at that address only', async () => {
+  for (const Host of ['be-there-gp50.onrender.com', 'bethere.gladspring.org']) {
+    for (const pathname of ['/healthz', '/visit', '/api/config', '/js/moved.js']) {
+      const secure = await raw(srv, pathname, { Host, 'X-Forwarded-Proto': 'https' });
+      assert.equal(secure.status, 200);
+      // Six months, this address alone: no includeSubDomains (gladspring.org has other sites) and no preload.
+      assert.equal(secure.headers['strict-transport-security'], 'max-age=15552000', `${Host}${pathname}`);
+      const plain = await raw(srv, pathname, { Host });
+      assert.equal(plain.status, 200);
+      assert.equal(plain.headers['strict-transport-security'], undefined, `${Host}${pathname} over plain http`);
+    }
+  }
+});
+
+// A port that is free right now, for a server started as its own program.
+const freePort = () => new Promise((resolve, reject) => {
+  const probe = net.createServer();
+  probe.once('error', reject);
+  probe.listen(0, () => { const { port } = probe.address(); probe.close(() => resolve(port)); });
+});
+
+// Starts the real server as the host does (`node server.js`) and gives back
+// everything it printed while starting. Its data file would go in a folder of
+// its own outside the repository, and it is given none of this machine's
+// settings.
+async function startupOutput(extraEnv) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'be-there-test-'));
+  try {
+    const child = spawn(process.execPath, [fileURLToPath(new URL('../server.js', import.meta.url))], {
+      cwd: dir,
+      env: { PATH: process.env.PATH, PORT: String(await freePort()), DATA_FILE: path.join(dir, 'db.json'), ...extraEnv },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    let out = '';
+    let stopping = false;
+    const exited = new Promise((resolve) => child.on('exit', resolve));
+    const stop = () => { if (!stopping) { stopping = true; child.kill('SIGTERM'); } };
+    const giveUp = setTimeout(() => child.kill('SIGKILL'), 10_000);
+    for (const stream of [child.stdout, child.stderr]) {
+      stream.setEncoding('utf8');
+      // "Relay: …" is printed before the lines about the address; a moment
+      // later everything it says at startup has been said.
+      stream.on('data', (text) => { out += text; if (/^Relay:/m.test(out)) setTimeout(stop, 200); });
+    }
+    await exited;
+    clearTimeout(giveUp);
+    return out;
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+test('starting the server: one plain line about the new address, and a wrong value is never printed', async () => {
+  const off = await startupOutput({});
+  assert.match(off, /^Be There on http:\/\/localhost:\d+/m);
+  assert.doesNotMatch(off, /address|CANONICAL/i, 'nothing is said when it is not set');
+
+  const on = await startupOutput({ CANONICAL_ORIGIN: NEW_ADDRESS });
+  assert.match(on, /^New address: https:\/\/bethere\.gladspring\.org /m);
+  assert.doesNotMatch(on, /ignored/);
+
+  const wrong = await startupOutput({ CANONICAL_ORIGIN: 'https://bethere.gladspring.org.evil.example/secret-path' });
+  assert.match(wrong, /^CANONICAL_ORIGIN is set to an address this version does not know, so it is ignored\. Nothing moves\.$/m);
+  assert.equal(wrong.match(/CANONICAL_ORIGIN/g).length, 1, 'said once');
+  assert.doesNotMatch(wrong, /evil|secret-path|New address/);
 });

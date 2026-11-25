@@ -14,6 +14,7 @@ import { createStore } from './lib/store.js';
 import { visitStatus, visitorView, homeView, MODES, DROP_IN_NOTICE_SECONDS } from './lib/rules.js';
 import { sameHash, hashToken } from './lib/tokens.js';
 import { publicIceServers, createRelay } from './lib/ice.js';
+import { CANONICAL_ALLOW, canonicalOriginFrom } from './lib/address.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const RING_SECONDS = 45;
@@ -52,15 +53,30 @@ export function createApp({
   env = process.env,
   relay = createRelay({ env }),
   now = Date.now,
+  // Be There's new address, if it has been switched on. Only an address on
+  // the list in lib/address.js is ever used; the two options are there so
+  // that tests can use an address on this machine.
+  canonicalOrigin = env.CANONICAL_ORIGIN,
+  canonicalAllow = CANONICAL_ALLOW,
 } = {}) {
+  const address = canonicalOriginFrom(canonicalOrigin, canonicalAllow);
   const app = express();
   app.set('trust proxy', 1);
   app.disable('x-powered-by');
   app.use(express.json({ limit: '16kb' }));
 
+  // Every address this server is reached at is served alike. There is no
+  // redirect and no check of the Host header anywhere: devices hold links on
+  // the first address, a connection to /ws cannot follow a redirect, and the
+  // host's health check must always get its 200. A device moves to the new
+  // address from inside its own page (public/js/moved.js).
+
   // Private and early: keep it out of search engines; links carry secrets after
   // the # (never sent to servers) and no referrer leaves the site.
   app.use((req, res, next) => {
+    // Reached over HTTPS once, a browser keeps to HTTPS at that address (the
+    // camera needs it anyway). This address only: no subdomains, no preload.
+    if (req.secure) res.set('Strict-Transport-Security', 'max-age=15552000');
     res.set({
       'X-Robots-Tag': 'noindex, nofollow',
       'Referrer-Policy': 'no-referrer',
@@ -75,8 +91,9 @@ export function createApp({
   app.get('/healthz', (req, res) => res.json({ ok: true }));
   // Anyone can read this, so it only ever lists public STUN servers. Relay
   // credentials go to the two devices of a live visit, over their own
-  // connections, and nowhere else.
-  app.get('/api/config', (req, res) => res.json({ iceServers: publicIceServers(env), dropInNoticeSeconds: DROP_IN_NOTICE_SECONDS }));
+  // connections, and nowhere else. canonicalOrigin is the new address (or
+  // null): visitor, organizer and setup pages go there by themselves.
+  app.get('/api/config', (req, res) => res.json({ iceServers: publicIceServers(env), dropInNoticeSeconds: DROP_IN_NOTICE_SECONDS, canonicalOrigin: address.origin }));
 
   // ----- Setting up a home (needs SETUP_PASSWORD when it is set) -----
   app.post('/api/homes', rateLimit(5), (req, res) => {
@@ -442,11 +459,11 @@ export function createApp({
     });
   }
 
-  return { app, onConnection, shutdown, relayReady: !!relay.ready };
+  return { app, onConnection, shutdown, relayReady: !!relay.ready, canonicalOrigin: address.origin, canonicalIgnored: address.ignored };
 }
 
 export function startServer({ port = Number(process.env.PORT) || 3000, ...options } = {}) {
-  const { app, onConnection, shutdown, relayReady } = createApp(options);
+  const { app, onConnection, shutdown, relayReady, canonicalOrigin, canonicalIgnored } = createApp(options);
   const server = http.createServer(app);
   const wss = new WebSocketServer({ server, path: '/ws', maxPayload: 64 * 1024 });
   wss.on('connection', onConnection);
@@ -465,6 +482,8 @@ export function startServer({ port = Number(process.env.PORT) || 3000, ...option
         server,
         url: `http://localhost:${actual}`,
         relayReady,
+        canonicalOrigin,
+        canonicalIgnored,
         close: async () => {
           clearInterval(beat);
           await shutdown();
@@ -478,9 +497,13 @@ export function startServer({ port = Number(process.env.PORT) || 3000, ...option
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
-  const { url, relayReady, close } = await startServer();
+  const { url, relayReady, canonicalOrigin, canonicalIgnored, close } = await startServer();
   console.log(`Be There on ${url}${process.env.SETUP_PASSWORD ? '' : ' (no SETUP_PASSWORD: anyone can create a home)'}`);
   console.log(relayReady ? 'Relay: set up.' : 'Relay: not set up (visits connect directly only).');
+  // The value that was set is never printed: only the address from the list
+  // in the code, or that something else was asked for and left alone.
+  if (canonicalOrigin) console.log(`New address: ${canonicalOrigin} (visitor, organizer and setup pages go there by themselves; the home screen stays where it is).`);
+  if (canonicalIgnored) console.warn('CANONICAL_ORIGIN is set to an address this version does not know, so it is ignored. Nothing moves.');
   // The host stops the old server on every deploy. End visits properly first,
   // so no relay credentials are left working after it has gone.
   process.once('SIGTERM', () => {

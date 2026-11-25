@@ -4,12 +4,16 @@
 //
 // It also checks the relay, with a small relay server of our own on this
 // machine (node-turn) standing in for Cloudflare's: nothing here leaves the
-// machine. It takes about a minute, half of it waiting for a visit that is
-// meant not to connect.
+// machine. Then the new address: one server reached by two names, as the real
+// one is, and pages that move from the old name to the new one (or stay).
+// It takes about a minute and a half, a third of it waiting for a visit that
+// is meant not to connect.
 import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
 import dgram from 'node:dgram';
 import fs from 'node:fs';
+import http from 'node:http';
+import net from 'node:net';
 import path from 'node:path';
 import { createRequire } from 'node:module';
 import { startServer } from '../server.js';
@@ -23,15 +27,17 @@ const Turn = require('node-turn');
 const shots = process.env.SHOTS;
 if (shots) fs.mkdirSync(shots, { recursive: true });
 const snap = async (page, name) => { if (shots) await page.screenshot({ path: path.join(shots, `${name}.png`) }); };
-// The same screen at tablet and phone size, in light and dark.
+// The same screen at tablet and phone size, in light and dark. `top` names
+// the part of the page to bring to the top of each picture.
 const SIZES = { tablet: { width: 1180, height: 820 }, phone: { width: 390, height: 844 } };
-const snapAll = async (page, name) => {
+const snapAll = async (page, name, top) => {
   if (!shots) return;
   const was = page.viewportSize();
   for (const [size, viewport] of Object.entries(SIZES)) {
     for (const colorScheme of ['light', 'dark']) {
       await page.setViewportSize(viewport);
       await page.emulateMedia({ colorScheme });
+      if (top) await page.locator(top).evaluate((node) => node.scrollIntoView({ block: 'start' }));
       await page.waitForTimeout(150);
       await page.screenshot({ path: path.join(shots, `${name}-${size}-${colorScheme}.png`) });
     }
@@ -128,6 +134,37 @@ const chosenPath = (page) => page.evaluate(async () => {
 });
 const pathLine = (page, text) => page.waitForFunction((t) => document.querySelector('#path')?.textContent === t, text, { timeout: 20_000 });
 
+// ----- The new address -----
+// A port nothing is listening on (it was free a moment ago).
+const freeTcpPort = () => new Promise((resolve, reject) => {
+  const probe = net.createServer();
+  probe.once('error', reject);
+  probe.listen(0, () => { const { port } = probe.address(); probe.close(() => resolve(port)); });
+});
+// A Be There server whose new address is `canonical(port)`. The browser takes
+// "localhost" and "127.0.0.1" for two different sites, though they are one
+// server: here "localhost" is the old address and "127.0.0.1" the new one.
+const noRelay = { ready: false, ttl: 0, mint: async () => ({ ok: false, reason: 'not_set_up' }), revoke: async () => {} };
+const extras = [];      // more servers to stop at the end
+const serverWithNewAddress = async (canonical) => {
+  const port = await freeTcpPort();
+  const canonicalOrigin = canonical(port);
+  const store = createStore(':memory:');
+  const server = await startServer({ port, store, setupPassword: '', env, relay: noRelay, canonicalOrigin, canonicalAllow: [canonicalOrigin] });
+  extras.push(() => server.close());
+  return { server, store, old: server.url, canonicalOrigin };
+};
+const originOf = (page) => new URL(page.url()).origin;
+// What this browser remembers at one address: read from a page there that
+// runs no script of ours.
+const rememberedAt = async (ctx, origin, key) => {
+  const page = await ctx.newPage();
+  await page.goto(`${origin}/healthz`);
+  const value = await page.evaluate((k) => localStorage.getItem(k), key);
+  await page.close();
+  return value;
+};
+
 let failure = null;
 try {
   // The organizer sets up a home through the real setup page.
@@ -152,6 +189,12 @@ try {
   await org.waitForSelector('#new-link:not([hidden])');
   const visitLink = await org.textContent('#new-url');
   assert.equal(await org.getAttribute('#new-open', 'href'), visitLink, '“Open it on this phone” opens the full link');
+  // This server has no new address: links are for the address the page is at,
+  // and nothing is said about moving.
+  assert.ok(visitLink.startsWith(`${srv.url}/visit#`));
+  assert.ok(homeLink.startsWith(`${srv.url}/home#`));
+  assert.equal(await org.isVisible('#moved-note'), false);
+  assert.match(await org.innerText('.tips'), /Keeping the tablet ready/);
   await snap(org, '2-organizer');
   step('invited Sarah');
 
@@ -396,6 +439,267 @@ try {
   assert.equal(await stranger.isVisible('#visit'), false);
   step('visitor link is remembered on the phone; a bare link shows no button');
 
+  // ----- The new address -----
+  const hasVideoOn = (...pages) => Promise.all(pages.map(hasVideo));
+  const moved = await serverWithNewAddress((port) => `http://127.0.0.1:${port}`);
+  const OLD = moved.old;
+  const NEW = moved.canonicalOrigin;
+  assert.notEqual(OLD, NEW);
+  const arrives = (page, check) => page.waitForURL((url) => url.origin === NEW && check(url), { timeout: 10_000 });
+
+  // Setting up from the old address: the page goes to the new one first, and
+  // the links it makes are for the new one.
+  const family = await browser.newContext({ viewport: { width: 1000, height: 900 } });
+  const setup2 = await family.newPage();
+  await setup2.goto(`${OLD}/setup`, { waitUntil: 'commit' });
+  await arrives(setup2, (url) => url.pathname === '/setup');
+  await setup2.fill('input[name=personName]', 'Rose');
+  await setup2.fill('input[name=start]', '00:00');
+  await setup2.fill('input[name=end]', '23:59');
+  await setup2.click('button[type=submit]');
+  await setup2.waitForSelector('#done:not([hidden])');
+  const roseHomeLink = await setup2.textContent('#home-link');
+  const roseOrgLink = await setup2.textContent('#org-link');
+  assert.ok(roseHomeLink.startsWith(`${NEW}/home#`), 'the home screen link is for the new address');
+  assert.ok(roseOrgLink.startsWith(`${NEW}/organize#`));
+  assert.equal(await setup2.getAttribute('#org-open', 'href'), roseOrgLink);
+  assert.match(await setup2.innerText('#done'), /Keeping the tablet ready/);
+  assert.match(await setup2.innerText('#done'), /Auto-Lock to Never/);
+  await snapAll(setup2, '17-setup-done-tablet-tips', '#done .link-box >> nth=1');
+  step('new address: the setup page moved there, and its links point there');
+
+  // The organizer's bookmark is for the old address. The page moves, with its
+  // link, and says how the home screen can be moved.
+  const org2 = await family.newPage();
+  org2.on('dialog', (dialog) => dialog.accept());
+  const orgSecret = new URL(roseOrgLink).hash;
+  await org2.goto(`${OLD}/organize${orgSecret}`, { waitUntil: 'commit' });
+  await arrives(org2, (url) => url.pathname === '/organize' && url.hash === orgSecret);
+  await org2.waitForSelector('#content:not([hidden])');
+  assert.equal(await org2.textContent('#title'), 'Rose’s home');
+  assert.equal(await org2.isVisible('#moved-note'), true);
+  assert.equal(await org2.textContent('#moved-note'), `Be There now lives at ${new URL(NEW).host}. The home screen keeps working where it is. To move it, make a new home screen link here and open it on the tablet when someone is with them; it will ask to use the camera and microphone once more.`);
+  assert.match(await org2.innerText('.tips'), /Keeping the tablet ready/);
+  await org2.fill('#invite input[name=name]', 'Tom');
+  await org2.click('#invite button[type=submit]');
+  await org2.waitForSelector('#new-link:not([hidden])');
+  const tomLink = await org2.textContent('#new-url');
+  assert.ok(tomLink.startsWith(`${NEW}/visit#`), 'a visitor link made now is for the new address');
+  assert.equal(await org2.getAttribute('#new-open', 'href'), tomLink);
+  const tomSecret = new URL(tomLink).hash;
+  await snapAll(org2, '18-organizer-links-new-address', '#moved-note');
+  step('new address: the organizer page moved with its link; its new links point there');
+
+  // The home screen is opened at the old address, as the tablet has it today.
+  // It stays there, and it does not so much as look at the new address.
+  const tabletCtx = await browser.newContext({ viewport: { width: 1180, height: 820 }, permissions: ['camera', 'microphone'] });
+  await tabletCtx.addInitScript(watchPeers);
+  const tablet = await tabletCtx.newPage();
+  const tabletAsked = [];
+  tablet.on('request', (request) => tabletAsked.push(request.url()));
+  tablet.on('websocket', (socket) => tabletAsked.push(socket.url()));
+  const roseHomeSecret = new URL(roseHomeLink).hash;
+  await tablet.goto(`${OLD}/home${roseHomeSecret}`);
+  await tablet.waitForFunction(() => document.querySelector('#status')?.textContent === 'Visits are open');
+  await tablet.click('#start');
+  await tablet.waitForSelector('.person.pending');
+  await tablet.waitForTimeout(1500);
+  assert.equal(originOf(tablet), OLD, 'the home screen is still at the old address');
+  assert.equal(new URL(tablet.url()).hash, roseHomeSecret);
+  assert.ok(tabletAsked.length > 5);
+  assert.deepEqual(tabletAsked.filter((url) => !url.startsWith(`${OLD}/`) && !url.startsWith(`${OLD.replace('http', 'ws')}/`)), [], 'everything the home screen asked for was at the old address');
+  assert.ok(!tabletAsked.some((url) => url.includes('moved.js')), 'the home screen does not load the script that moves pages');
+  await org2.reload();
+  await org2.waitForFunction(() => document.querySelector('#online')?.textContent === 'Home screen is on');
+  assert.equal(originOf(org2), NEW);
+  step('new address: the home screen stayed at the old address and is on');
+
+  // Tom opens his link at the old address, with its # part. His page moves to
+  // the new address with the same secret, and connects there.
+  const tomCtx = await browser.newContext({ viewport: { width: 390, height: 844 }, permissions: ['camera', 'microphone'] });
+  await tomCtx.addInitScript(watchPeers);
+  const tom = await tomCtx.newPage();
+  await tom.goto(`${OLD}/visit${tomSecret}`, { waitUntil: 'commit' });
+  await arrives(tom, (url) => url.pathname === '/visit' && url.hash === tomSecret);
+  await tom.waitForFunction(() => document.querySelector('#state')?.textContent.includes('Waiting for them'));
+  assert.equal(tom.url(), `${NEW}/visit${tomSecret}`);
+  // Both addresses now remember the link on this phone: the old one was not cleared.
+  assert.equal(await rememberedAt(tomCtx, NEW, 'bethere.visit'), tomSecret.slice(1));
+  assert.equal(await rememberedAt(tomCtx, OLD, 'bethere.visit'), tomSecret.slice(1));
+  step('new address: a visitor link opened at the old address arrived with its secret');
+
+  // Rose says yes on her screen (old address); Tom (new address) knocks, and
+  // they see each other: it is one server behind both names.
+  await tablet.click('.person.pending .btn.yes');
+  await tom.waitForFunction(() => !document.querySelector('#visit').disabled);
+  await tom.click('#visit');
+  await tablet.waitForSelector('#knock:not([hidden])');
+  assert.match(await tablet.textContent('#knock-title'), /Tom is here to see you/);
+  await tablet.click('#answer');
+  await hasVideoOn(tablet, tom);
+  assert.match(await tablet.textContent('#with-you-text'), /Tom is with you/);
+  assert.equal(originOf(tablet), OLD);
+  assert.equal(originOf(tom), NEW);
+  await tablet.click('#end');
+  await tom.waitForSelector('#lobby:not([hidden])');
+  step('new address: a visit between a home screen at the old address and a visitor at the new one');
+
+  // A phone that only remembers the link at the old address (a bookmark
+  // without the # part): it arrives at the new address with the secret too.
+  const bookmarkCtx = await browser.newContext({ viewport: { width: 390, height: 844 } });
+  const seed = await bookmarkCtx.newPage();
+  await seed.goto(`${OLD}/healthz`);
+  await seed.evaluate((secret) => localStorage.setItem('bethere.visit', secret), tomSecret.slice(1));
+  await seed.close();
+  assert.equal(await rememberedAt(bookmarkCtx, NEW, 'bethere.visit'), null, 'the new address knows nothing of this phone yet');
+  const bookmark = await bookmarkCtx.newPage();
+  await bookmark.goto(`${OLD}/visit`, { waitUntil: 'commit' });
+  await arrives(bookmark, (url) => url.pathname === '/visit' && url.hash === tomSecret);
+  await bookmark.waitForFunction(() => document.querySelector('#title')?.textContent === 'Visit Rose');
+  assert.equal(await rememberedAt(bookmarkCtx, OLD, 'bethere.visit'), tomSecret.slice(1));
+  // What a link has before its # is kept as well ("?relay=1" tests the relay).
+  await bookmark.goto(`${OLD}/visit?relay=1${tomSecret}`, { waitUntil: 'commit' });
+  await arrives(bookmark, (url) => url.pathname === '/visit' && url.search === '?relay=1' && url.hash === tomSecret);
+  // A phone with no link at all moves too, and is told the same as before.
+  const nobody = await (await browser.newContext()).newPage();
+  await nobody.goto(`${OLD}/visit`, { waitUntil: 'commit' });
+  await arrives(nobody, (url) => url.pathname === '/visit' && url.hash === '');
+  await nobody.waitForFunction(() => document.querySelector('#title')?.textContent.includes('missing its key'));
+  await bookmarkCtx.close();
+  step('new address: a remembered link without its # arrived with its secret');
+
+  // Moving the home screen is done by the family: a new home screen link from
+  // the organizer page, opened on the tablet.
+  await org2.click('#new-home-link');
+  await org2.waitForSelector('#home-link-box:not([hidden])');
+  const movedHomeLink = await org2.textContent('#home-url');
+  assert.ok(movedHomeLink.startsWith(`${NEW}/home#`), 'the new home screen link is for the new address');
+  await tablet.waitForFunction(() => !document.querySelector('#problem').hidden);
+  assert.equal(originOf(tablet), OLD, 'the old home screen says its link no longer works; it does not move');
+  await tablet.goto(movedHomeLink);
+  await tablet.waitForFunction(() => document.querySelector('#status')?.textContent === 'Visits are open');
+  await tablet.click('#start');
+  assert.equal(originOf(tablet), NEW);
+  await tom.waitForFunction(() => { const b = document.querySelector('#visit'); return b && !b.hidden && !b.disabled; });
+  await tom.click('#visit');
+  await tablet.waitForSelector('#knock:not([hidden])');
+  await tablet.click('#answer');
+  await hasVideoOn(tablet, tom);
+  await tom.click('#end');
+  await tablet.waitForSelector('#idle:not([hidden])');
+  // The organizer's own link, made again, is for the new address as well.
+  await org2.click('#new-org-link');
+  await org2.waitForSelector('#org-link-box:not([hidden])');
+  const newOrgLink = await org2.textContent('#org-url');
+  assert.ok(newOrgLink.startsWith(`${NEW}/organize#`));
+  assert.equal(org2.url(), newOrgLink);
+  await tabletCtx.close();
+  await tomCtx.close();
+  await family.close();
+  step('new address: the home screen moved when its new link was opened on the tablet, and a visit worked there');
+
+  // ----- When the new address does not answer -----
+  // Its name leads nowhere: once to a port browsers will not talk to at all,
+  // once to a port where nothing listens. Every page stays where it is and
+  // works as before.
+  const away = await serverWithNewAddress(() => 'http://127.0.0.1:9');
+  const closedPort = await freeTcpPort();
+  const shut = await serverWithNewAddress(() => `http://127.0.0.1:${closedPort}`);
+  for (const [name, world] of [['a port browsers refuse to talk to', away], ['a port where nothing listens', shut]]) {
+    const HERE = world.old;
+    const ctx = await browser.newContext({ viewport: { width: 1000, height: 820 }, permissions: ['camera', 'microphone'] });
+    const setup3 = await ctx.newPage();
+    await setup3.goto(`${HERE}/setup`);
+    await setup3.fill('input[name=personName]', 'Ann');
+    await setup3.fill('input[name=start]', '00:00');
+    await setup3.fill('input[name=end]', '23:59');
+    await setup3.click('button[type=submit]');
+    await setup3.waitForSelector('#done:not([hidden])');
+    assert.equal(originOf(setup3), HERE, `${name}: the setup page stayed`);
+    // Links are for the new address from the day it is switched on, whether
+    // or not this page could reach it just now.
+    const annHome = new URL(await setup3.textContent('#home-link'));
+    const annOrg = new URL(await setup3.textContent('#org-link'));
+    assert.equal(annHome.origin, world.canonicalOrigin);
+    assert.equal(annOrg.origin, world.canonicalOrigin);
+
+    const org3 = await ctx.newPage();
+    await org3.goto(`${HERE}/organize${annOrg.hash}`);
+    await org3.waitForSelector('#content:not([hidden])');
+    assert.equal(await org3.textContent('#title'), 'Ann’s home');
+    assert.equal(originOf(org3), HERE, `${name}: the organizer page stayed`);
+    assert.equal(new URL(org3.url()).hash, annOrg.hash);
+    await org3.fill('#invite input[name=name]', 'Ben');
+    await org3.click('#invite button[type=submit]');
+    await org3.waitForSelector('#new-link:not([hidden])');
+    const benLink = new URL(await org3.textContent('#new-url'));
+    assert.equal(benLink.origin, world.canonicalOrigin);
+    assert.equal(await org3.isVisible('#moved-note'), true);
+    const benSecret = benLink.hash;
+
+    const home3 = await ctx.newPage();
+    await home3.goto(`${HERE}/home${annHome.hash}`);
+    await home3.waitForSelector('.person.pending');
+    await home3.click('#start');
+    await home3.click('.person.pending .btn.yes');
+    assert.equal(originOf(home3), HERE, `${name}: the home screen stayed`);
+
+    const ben = await ctx.newPage();
+    await ben.goto(`${HERE}/visit${benSecret}`);
+    await ben.waitForFunction(() => { const b = document.querySelector('#visit'); return b && !b.hidden && !b.disabled; });
+    assert.equal(ben.url(), `${HERE}/visit${benSecret}`, `${name}: the visitor page stayed, with its link`);
+    await ben.click('#visit');
+    await home3.waitForSelector('#knock:not([hidden])');
+    await home3.click('#answer');
+    await hasVideoOn(home3, ben);
+    await ben.click('#end');
+    await home3.waitForSelector('#idle:not([hidden])');
+    for (const page of [setup3, org3, home3, ben]) assert.equal(originOf(page), HERE);
+    await ctx.close();
+  }
+  step('new address not answering: every page stayed where it was, and a visit worked');
+
+  // Two more ways the new address can be wrong, seen from the visitor's page:
+  // a host that accepts the connection and then says nothing, and one that
+  // serves web pages but has no live connection for visits. The page stays in
+  // both cases, and the link's secret is never sent to that host.
+  const heard = { silent: '', pagesOnly: '' };
+  const held = new Set();
+  const silent = net.createServer((socket) => {
+    held.add(socket);
+    socket.on('data', (chunk) => { heard.silent += chunk; });
+    socket.on('error', () => {});
+    socket.on('close', () => held.delete(socket));
+  });
+  const pagesOnly = http.createServer((req, res) => {
+    heard.pagesOnly += `${req.method} ${req.url}\n`;
+    res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+    res.end('{"ok":true}');
+  });
+  pagesOnly.on('upgrade', (req, socket) => { heard.pagesOnly += `UPGRADE ${req.url}\n`; socket.destroy(); });
+  for (const other of [silent, pagesOnly]) {
+    await new Promise((resolve) => other.listen(0, '127.0.0.1', resolve));
+    extras.push(() => new Promise((resolve) => { for (const socket of held) socket.destroy(); other.closeAllConnections?.(); other.close(resolve); }));
+  }
+  for (const [name, other, least, most] of [['silent', silent, 3500, 9000], ['pagesOnly', pagesOnly, 0, 3500]]) {
+    const world = await serverWithNewAddress(() => `http://127.0.0.1:${other.address().port}`);
+    const { home: annHome } = world.store.createHome({ personName: 'Ann', hours: { start: '00:00', end: '00:00' } });
+    const { token } = world.store.addVisitor(annHome, { name: 'Ben' });
+    const page = await (await browser.newContext()).newPage();
+    const began = Date.now();
+    await page.goto(`${world.old}/visit#${token}`);
+    await page.waitForFunction(() => document.querySelector('#state')?.textContent.includes('Waiting for them'), null, { timeout: 15_000 });
+    const took = Date.now() - began;
+    assert.equal(page.url(), `${world.old}/visit#${token}`, `${name}: the page stayed, with its link`);
+    assert.ok(took >= least && took <= most, `${name}: the page was ready after ${took} ms`);
+    assert.doesNotMatch(heard[name], new RegExp(token), `${name}: the secret never reached the other host`);
+    await page.context().close();
+  }
+  // All either host ever heard was the knock on the door for visits.
+  assert.match(heard.silent, /^GET \/ws HTTP\/1\.1\r\n/);
+  assert.equal(heard.pagesOnly, 'UPGRADE /ws\n');
+  step('new address answering wrongly (silent, or pages only): the visitor page stayed after a short wait');
+
   console.log('E2E passed');
 } catch (err) {
   failure = err;
@@ -403,6 +707,7 @@ try {
 } finally {
   await browser.close();
   await srv.close();
+  for (const stop of extras) await stop().catch(() => {});
   turn.stop();
 }
 // The little relay server keeps timers of its own running for some minutes

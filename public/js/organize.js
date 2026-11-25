@@ -1,8 +1,12 @@
 // The organizer page: for the family member who set things up.
 import { $, el, api, tokenFromLink, copyText } from './common.js';
+import { goToNewAddress, newAddress } from './moved.js';
 
 let token = tokenFromLink();
 let home = null;
+// Where the links made here point: at the new address once there is one,
+// whichever address this page was opened at.
+let linkBase = location.origin;
 
 const call = (path, opts = {}) => api(path, { token, ...opts });
 
@@ -66,7 +70,7 @@ $('#invite').addEventListener('submit', async (e) => {
   try {
     const res = await call('/api/organize/visitors', { method: 'POST', body: { name: f.get('name'), relation: f.get('relation') } });
     $('#new-name').textContent = res.visitor.name;
-    const url = `${location.origin}/visit#${res.token}`;
+    const url = `${linkBase}/visit#${res.token}`;
     $('#new-url').textContent = url;
     $('#new-open').href = url;
     offerShare($('#new-share'), url, `Your Be There link to visit ${home.personName}`);
@@ -100,7 +104,7 @@ $('#relay-test').addEventListener('click', async () => {
 $('#new-home-link').addEventListener('click', async () => {
   if (!confirm('Make a new home screen link? The current home screen will stop working until you open the new link on it.')) return;
   const res = await call('/api/organize/home-link', { method: 'POST' });
-  const homeUrl = `${location.origin}/home#${res.homeToken}`;
+  const homeUrl = `${linkBase}/home#${res.homeToken}`;
   $('#home-url').textContent = homeUrl;
   offerShare($('#home-share'), homeUrl, `Be There home screen for ${home.personName}`);
   $('#home-link-box').hidden = false;
@@ -110,7 +114,7 @@ $('#new-org-link').addEventListener('click', async () => {
   if (!confirm('Make a new organizer link? This one will stop working.')) return;
   const res = await call('/api/organize/organizer-link', { method: 'POST' });
   token = res.organizerToken;
-  const url = `${location.origin}/organize#${token}`;
+  const url = `${linkBase}/organize#${token}`;
   history.replaceState(null, '', `/organize#${token}`);
   $('#org-url').textContent = url;
   $('#org-link-box').hidden = false;
@@ -127,8 +131,24 @@ document.addEventListener('click', (e) => {
   if (id) copyText($(`#${id}`).textContent, e.target);
 });
 
-if (!token) $('#error').textContent = 'This page needs your organizer link.';
-else {
-  load();
-  setInterval(load, 15_000);
+async function start() {
+  // If Be There has a new address, go there first, with the link. When the
+  // page moves, this never comes back and nothing is loaded here.
+  await goToNewAddress('organize', token);
+  const movedTo = await newAddress();
+  if (movedTo) {
+    linkBase = movedTo;
+    // The home screen is the one page that does not move by itself: say how
+    // the family can move it.
+    if ($('#moved-note')) {
+      $('#moved-host').textContent = new URL(movedTo).host;
+      $('#moved-note').hidden = false;
+    }
+  }
+  if (!token) $('#error').textContent = 'This page needs your organizer link.';
+  else {
+    load();
+    setInterval(load, 15_000);
+  }
 }
+start();

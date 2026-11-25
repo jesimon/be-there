@@ -183,3 +183,11 @@ legend { font-weight: 600; padding: 0 6px; }
 .link-actions { display: flex; flex-wrap: wrap; gap: 10px; }
 #relay-state { font-weight: 600; }
 .relay-result { font-weight: 600; min-height: 1.5em; margin: 0.6em 0 0; }
+
+/* Organizer and setup pages: a few words about the new address, and how to
+   keep the tablet ready for visits. */
+.moved-note { background: var(--open-bg); border: 2px solid var(--green); border-radius: var(--radius); padding: 12px 14px; margin: 0 0 14px; }
+.moved-note strong { overflow-wrap: anywhere; }
+.tips { margin: 18px 0; padding: 12px 14px; background: var(--bg); border: 2px solid var(--line); border-radius: var(--radius); }
+.tips ul { margin: 0; padding-left: 1.2em; }
+.tips li { margin: 0.3em 0; }

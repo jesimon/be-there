@@ -2,6 +2,7 @@
 // in, if the person at home allows it).
 import { $, rememberedToken, forgetToken, connect, getCamera, stopStream } from './common.js';
 import { startCall as startPeer } from './peer.js';
+import { goToNewAddress } from './moved.js';
 
 // "?relay=1" before the # sends this visit through the relay from the start:
 // a way to check that the relay works. Read it first, because remembering the
@@ -170,12 +171,14 @@ function onMessage(msg) {
   }
 }
 
-if (!token) {
-  $('#title').textContent = 'This link is missing its key';
-  $('#state').textContent = 'Open your Be There link again, in full.';
-  $('#hint').textContent = 'The long code after the # was lost. If you set things up, use “Open it on this phone” on the organizer page.';
-  $('#visit').hidden = true;
-} else {
+function start() {
+  if (!token) {
+    $('#title').textContent = 'This link is missing its key';
+    $('#state').textContent = 'Open your Be There link again, in full.';
+    $('#hint').textContent = 'The long code after the # was lost. If you set things up, use “Open it on this phone” on the organizer page.';
+    $('#visit').hidden = true;
+    return;
+  }
   link = connect({
     role: 'visitor',
     token,
@@ -192,3 +195,8 @@ if (!token) {
     },
   });
 }
+
+// If Be There has a new address, go there first, with the link, before this
+// page connects to anything: a visit is never interrupted by the move. When
+// the page moves, this never comes back and nothing is started here.
+goToNewAddress('visit', token).then(start);

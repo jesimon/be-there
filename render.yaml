@@ -29,3 +29,12 @@ services:
       # service's Environment page.
       - key: SETUP_PASSWORD
         generateValue: true
+      # Be There's new address. With this set, visitor, organizer and setup
+      # pages opened at the onrender.com address go on to it by themselves, and
+      # new links point at it. The home screen never moves by itself. Only the
+      # address built into lib/address.js is accepted; anything else is
+      # ignored. To stop devices moving, remove this line and also delete the
+      # variable on the service's Environment page (a sync may leave it there).
+      # Both addresses keep working either way.
+      - key: CANONICAL_ORIGIN
+        value: https://bethere.gladspring.org
