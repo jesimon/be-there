@@ -48,6 +48,9 @@ try {
   const homeCtx = await browser.newContext({ viewport: { width: 1180, height: 820 }, permissions: ['camera', 'microphone'] });
   const home = await homeCtx.newPage();
   await home.goto(homeLink);
+  // The screen connects without a tap: the organizer sees it is on.
+  await org.reload();
+  await org.waitForFunction(() => document.querySelector('#online')?.textContent === 'Home screen is on');
   await home.click('#start');
   await home.waitForSelector('.person.pending');
   await snap(home, '3-home-asks-mary');
