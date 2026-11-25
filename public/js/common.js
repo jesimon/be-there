@@ -159,6 +159,13 @@ export function unlockSound() {
     if (audioCtx.state === 'suspended') audioCtx.resume();
   } catch { /* no sound available */ }
 }
+// The page's one AudioContext, the chime's, for anything else that needs to
+// hear or make sound (live captions listen through it). Made if there is none
+// yet, so call it from a tap where you can. Null when the browser has none.
+export function soundContext() {
+  unlockSound();
+  return audioCtx || null;
+}
 export function chime() {
   if (!audioCtx) return;
   const now = audioCtx.currentTime;

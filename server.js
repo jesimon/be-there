@@ -16,6 +16,10 @@ import { sameHash, hashToken } from './lib/tokens.js';
 import { publicIceServers, createRelay } from './lib/ice.js';
 import { CANONICAL_ALLOW, canonicalOriginFrom } from './lib/address.js';
 import { acceptPhoto, PHOTO_LIMITS } from './lib/jpeg.js';
+import {
+  CAPTIONS_FILES, CAPTIONS_VERSION, captionsDirFrom, captionsSwitchedOff, captionsStatus, captionsFilePath, captionsType,
+  prepareCaptionsFiles, captionsCodeFrom,
+} from './lib/captions-files.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const RING_SECONDS = 45;
@@ -68,6 +72,17 @@ export function createApp({
   // that tests can use an address on this machine.
   canonicalOrigin = env.CANONICAL_ORIGIN,
   canonicalAllow = CANONICAL_ALLOW,
+  // Live captions: where their files are kept, and whether to fetch them if
+  // they are not there (the real server does; tests never do, unless they
+  // hand in a fetch of their own). The rest is for tests.
+  captions: {
+    dir: captionsDir = captionsDirFrom(env),
+    off: captionsOff = captionsSwitchedOff(env),
+    autoFetch = false,
+    files: captionsFiles = CAPTIONS_FILES,
+    version: captionsVersion = CAPTIONS_VERSION,
+    ...captionsFetching
+  } = {},
 } = {}) {
   const address = canonicalOriginFrom(canonicalOrigin, canonicalAllow);
   const app = express();
@@ -93,9 +108,64 @@ export function createApp({
       'X-Content-Type-Options': 'nosniff',
       'X-Frame-Options': 'DENY',
       'Permissions-Policy': 'camera=(self), microphone=(self), geolocation=()',
-      'Content-Security-Policy': "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data: blob:; media-src 'self' blob:; connect-src 'self' ws: wss:; frame-ancestors 'none'; base-uri 'none'; form-action 'self'",
+      // 'wasm-unsafe-eval' lets a page compile WebAssembly (live captions run
+      // their speech model that way, from our own files). It does not allow
+      // eval, and every script still has to come from this server.
+      'Content-Security-Policy': "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self'; img-src 'self' data: blob:; media-src 'self' blob:; connect-src 'self' ws: wss:; frame-ancestors 'none'; base-uri 'none'; form-action 'self'",
     });
     next();
+  });
+
+  // ----- Live captions: the files a tablet needs to make them -----
+  // Captions are worked out on the home screen's own tablet. The server's
+  // only part is to hand out the speech model and the library that runs it
+  // (lib/captions-files.js): fetched once from the addresses on its list,
+  // every byte checked, and kept beside the data file. 'ready': they are
+  // here and verified. 'preparing': they are being fetched now. 'off':
+  // switched off (CAPTIONS=off), or not here and not being fetched.
+  const captionsOptions = { files: captionsFiles, version: captionsVersion };
+  let captionsState = captionsOff ? 'off' : captionsStatus(captionsDir, captionsOptions) === 'ready' ? 'ready' : autoFetch ? 'preparing' : 'off';
+  const captionsStop = new AbortController();
+  const captionsSettled = captionsState !== 'preparing' ? Promise.resolve(captionsState)
+    : prepareCaptionsFiles(captionsDir, { ...captionsOptions, ...captionsFetching, signal: captionsStop.signal })
+      .catch(() => false)
+      .then((ok) => { captionsState = ok ? 'ready' : 'off'; return captionsState; });
+  // Only the files on the list, by their exact names, and only once they
+  // have been verified. They never change under a version, so a browser may
+  // keep them for good. Anything else under this address is "not found":
+  // the name asked for is looked up in the list, never on the disk.
+  const captionsByAddress = new Map(captionsFiles.map((f) => [`/${captionsVersion}/${f.path}`, f]));
+  app.use('/captions-files', (req, res) => {
+    const notFound = () => res.status(404).type('text/plain').send('Not found');
+    const f = captionsState === 'ready' && (req.method === 'GET' || req.method === 'HEAD') ? captionsByAddress.get(req.path) : null;
+    if (!f || !captionsFilePath(captionsDir, f.path, captionsFiles)) return notFound();
+    res.sendFile(f.path, {
+      root: path.resolve(captionsDir),
+      cacheControl: false,
+      headers: {
+        'Content-Type': captionsType(f.path),
+        'Cache-Control': 'public, max-age=31536000, immutable',
+        'Cross-Origin-Resource-Policy': 'same-origin',
+      },
+    }, (err) => { if (err && !res.headersSent) notFound(); });
+  });
+  // The three scripts captions run from, under an address that names their
+  // content. A home screen that fetched them from /js at the start of each
+  // visit would be asking the server something every time a visit began, and
+  // the host can see what is asked for and when. Under this address a
+  // browser keeps them, and a captioned visit asks for nothing. A page that
+  // is still open from before an update asks under the old name: it gets
+  // today's scripts, not to be kept.
+  const captionsCode = captionsCodeFrom(path.join(here, 'public', 'js'));
+  app.get('/captions-code/:id/:name', (req, res) => {
+    const bytes = req.path.endsWith('/') ? null : captionsCode.files.get(req.params.name);
+    if (!bytes) return res.status(404).type('text/plain').send('Not found');
+    res.set({
+      'Content-Type': 'text/javascript; charset=utf-8',
+      'Cache-Control': req.params.id === captionsCode.id ? 'public, max-age=31536000, immutable' : 'no-store',
+      'Cross-Origin-Resource-Policy': 'same-origin',
+    });
+    res.end(bytes);
   });
 
   app.get('/healthz', (req, res) => res.json({ ok: true }));
@@ -103,7 +173,15 @@ export function createApp({
   // credentials go to the two devices of a live visit, over their own
   // connections, and nowhere else. canonicalOrigin is the new address (or
   // null): visitor, organizer and setup pages go there by themselves.
-  app.get('/api/config', (req, res) => res.json({ iceServers: publicIceServers(env), dropInNoticeSeconds: DROP_IN_NOTICE_SECONDS, canonicalOrigin: address.origin }));
+  // captions says whether the home screen may offer captions; captionsCode
+  // names the scripts they run from (see above).
+  app.get('/api/config', (req, res) => res.json({
+    iceServers: publicIceServers(env),
+    dropInNoticeSeconds: DROP_IN_NOTICE_SECONDS,
+    canonicalOrigin: address.origin,
+    captions: captionsState,
+    captionsCode: captionsCode.id,
+  }));
 
   // ----- Setting up a home (needs SETUP_PASSWORD when it is set) -----
   app.post('/api/homes', rateLimit(5), (req, res) => {
@@ -264,9 +342,14 @@ export function createApp({
   // script and one old one after an update.
   const pub = path.join(here, 'public');
   const checkEveryTime = (res, file) => { if (/\.(html|js|css)$/.test(file)) res.setHeader('Cache-Control', 'no-cache'); };
-  for (const page of ['home', 'visit', 'organize', 'setup']) {
+  // "captions-check" is where a family tries captions on a device before
+  // relying on them. It needs no link and shows nothing about any home.
+  for (const page of ['home', 'visit', 'organize', 'setup', 'captions-check']) {
     app.get(`/${page}`, (req, res) => res.sendFile(path.join(pub, `${page}.html`), { cacheControl: false, headers: { 'Cache-Control': 'no-cache' } }));
   }
+  // Whose work the captions files are, with their licences: handed to anyone
+  // who is handed the files.
+  app.get('/third-party', (req, res) => res.sendFile(path.join(here, 'THIRD_PARTY.md'), { cacheControl: false, headers: { 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': 'no-cache' } }));
   app.use(express.static(pub, { extensions: ['html'], maxAge: '5m', etag: true, setHeaders: checkEveryTime }));
 
   // Photo uploads and requests are never logged, not even when one goes
@@ -379,6 +462,9 @@ export function createApp({
   // has been told that their credentials no longer work. Each request to it
   // gives up by itself after a few seconds; the limit here is a backstop.
   async function shutdown() {
+    // A fetch of the captions files that is still under way is given up; the
+    // next start carries on from the files that are already whole.
+    captionsStop.abort();
     for (const homeId of [...lives.keys()]) endCallIf(homeId, () => true, 'offline');
     let timer;
     const tooLong = new Promise((resolve) => { timer = setTimeout(resolve, 6000); });
@@ -548,11 +634,16 @@ export function createApp({
     });
   }
 
-  return { app, onConnection, shutdown, relayReady: !!relay.ready, canonicalOrigin: address.origin, canonicalIgnored: address.ignored };
+  return {
+    app, onConnection, shutdown, relayReady: !!relay.ready, canonicalOrigin: address.origin, canonicalIgnored: address.ignored,
+    // How captions stood when the server started, and (a promise) how they
+    // stand once any fetch of their files has finished or been given up.
+    captions: captionsState, captionsSettled,
+  };
 }
 
 export function startServer({ port = Number(process.env.PORT) || 3000, ...options } = {}) {
-  const { app, onConnection, shutdown, relayReady, canonicalOrigin, canonicalIgnored } = createApp(options);
+  const { app, onConnection, shutdown, relayReady, canonicalOrigin, canonicalIgnored, captions, captionsSettled } = createApp(options);
   const server = http.createServer(app);
   const wss = new WebSocketServer({ server, path: '/ws', maxPayload: 64 * 1024 });
   wss.on('connection', onConnection);
@@ -573,9 +664,12 @@ export function startServer({ port = Number(process.env.PORT) || 3000, ...option
         relayReady,
         canonicalOrigin,
         canonicalIgnored,
+        captions,
+        captionsSettled,
         close: async () => {
           clearInterval(beat);
           await shutdown();
+          await captionsSettled;
           for (const ws of wss.clients) ws.terminate();
           wss.close();
           await new Promise((done) => server.close(done));
@@ -586,16 +680,31 @@ export function startServer({ port = Number(process.env.PORT) || 3000, ...option
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
-  const { url, relayReady, canonicalOrigin, canonicalIgnored, close } = await startServer();
+  // Only the real server fetches the captions files by itself. It does so in
+  // the background: starting never waits for them.
+  const { url, relayReady, canonicalOrigin, canonicalIgnored, captions, captionsSettled, close } = await startServer({ captions: { autoFetch: true } });
   console.log(`Be There on ${url}${process.env.SETUP_PASSWORD ? '' : ' (no SETUP_PASSWORD: anyone can create a home)'}`);
   console.log(relayReady ? 'Relay: set up.' : 'Relay: not set up (visits connect directly only).');
   // The value that was set is never printed: only the address from the list
   // in the code, or that something else was asked for and left alone.
   if (canonicalOrigin) console.log(`New address: ${canonicalOrigin} (visitor, organizer and setup pages go there by themselves; the home screen stays where it is).`);
   if (canonicalIgnored) console.warn('CANONICAL_ORIGIN is set to an address this version does not know, so it is ignored. Nothing moves.');
+  let stopping = false;
+  // Captions: one line now, and one more when a fetch of their files ends.
+  // (These are about the server's own files, never about a visit.)
+  if (captions === 'ready') console.log('Captions: ready.');
+  else if (captions === 'off') console.log('Captions: off (CAPTIONS=off).');
+  else {
+    console.log('Captions: fetching their files (about 50 MB, once). They are off until that is done.');
+    captionsSettled.then((state) => {
+      if (state === 'ready') console.log('Captions: files fetched and checked. Ready.');
+      else if (!stopping) console.log('Captions: the files could not be fetched. Captions stay off until the next start.');
+    });
+  }
   // The host stops the old server on every deploy. End visits properly first,
   // so no relay credentials are left working after it has gone.
   process.once('SIGTERM', () => {
+    stopping = true;
     setTimeout(() => process.exit(0), 8000).unref();
     close().finally(() => process.exit(0));
   });

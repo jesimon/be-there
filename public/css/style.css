@@ -195,6 +195,46 @@ legend { font-weight: 600; padding: 0 6px; }
 @keyframes pulse { 50% { box-shadow: 0 0 0 10px rgba(255, 59, 48, 0); } }
 @media (prefers-reduced-motion: reduce) { .live-dot { animation: none; } }
 .call .end { position: absolute; left: 50%; bottom: 20px; transform: translateX(-50%); }
+/* ---------- Captions on the home screen (a trial) ---------- */
+/* What the visitor says, in very large letters: white on near-black, for
+   someone who does not see or hear well. At most three lines show; older
+   words leave from the top as new ones arrive at the bottom. The edge is a
+   border, not padding, so that a line on its way out is cut off cleanly. */
+.captions {
+  box-sizing: border-box; margin: 0; max-height: calc(3 * 1.25em + 0.7em); overflow: hidden;
+  display: flex; flex-direction: column; justify-content: flex-end;
+  background: #111; color: #fff; border: 0.35em solid #111; border-radius: 16px; padding: 0 0.25em;
+  font-size: clamp(1.7rem, 3.8vw, 2.6rem); font-weight: 700; line-height: 1.25; text-align: left;
+}
+.captions p { flex: none; margin: 0; overflow-wrap: anywhere; }
+/* A line about the captions themselves ("Getting captions ready…"): always
+   shown whole, however narrow the screen. */
+.captions.is-status { font-weight: 600; max-height: none; }
+/* During a visit: above the buttons, beside the small picture of oneself,
+   and well clear of the name and red light at the top. */
+.call .captions {
+  position: absolute; left: 16px; bottom: 124px; right: calc(min(26vw, 240px) + 32px);
+}
+/* The foot of a visit on the home screen: the captions switch in the left
+   corner and "End visit" in the middle, the same height, never overlapping. */
+.home-screen .call-bar {
+  position: absolute; left: 16px; right: 16px; bottom: 20px;
+  display: grid; grid-template-columns: 1fr auto 1fr; align-items: end; gap: 12px;
+  pointer-events: none;
+}
+.home-screen .call-bar > * { pointer-events: auto; }
+.home-screen .call-bar .end { position: static; transform: none; grid-column: 2; }
+.captions-toggle {
+  grid-column: 1; justify-self: start; min-width: 0;
+  background: #fff; color: #1f2a24; border-color: #fff;
+}
+.captions-toggle.on { background: var(--green); color: var(--green-ink); border-color: var(--green); }
+@media (max-width: 700px) {
+  .home-screen .call-bar { grid-template-columns: 1fr; justify-items: center; }
+  .home-screen .call-bar .end, .captions-toggle { grid-column: 1; }
+  .call .captions { bottom: 224px; right: 16px; }
+}
+
 /* The visitor's side only: one small line, under the name, saying how the two
    devices are connected. */
 .path-line {
@@ -220,3 +260,11 @@ legend { font-weight: 600; padding: 0 6px; }
 .tips { margin: 18px 0; padding: 12px 14px; background: var(--bg); border: 2px solid var(--line); border-radius: var(--radius); }
 .tips ul { margin: 0; padding-left: 1.2em; }
 .tips li { margin: 0.3em 0; }
+
+/* The page for trying captions on a device (/captions-check). */
+.check-result { font-weight: 600; min-height: 1.5em; margin: 0.8em 0 0; }
+.check-page .captions { margin: 14px 0 0; }
+.check-page audio { display: none; }
+.check-verdict { font-size: 1.5rem; font-weight: 700; margin: 0 0 0.6em; }
+.check-numbers { margin: 0; padding: 12px 14px; background: var(--bg); border: 2px solid var(--line); border-radius: var(--radius); font: inherit; font-size: 0.95rem; white-space: pre-wrap; overflow-wrap: anywhere; }
+.check-numbers:empty { display: none; }

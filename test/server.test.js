@@ -21,6 +21,16 @@ import { startServer, createApp } from '../server.js';
 import { createStore } from '../lib/store.js';
 import { photosInMemory } from '../lib/photos.js';
 import { acceptPhoto, JFIF_START } from '../lib/jpeg.js';
+import { captionsCodeFrom, captionsDirFrom, captionsStatus } from '../lib/captions-files.js';
+
+// Live captions have tests of their own (test/captions-files.test.js). The
+// servers here are pointed at a folder that is never there, so that they
+// behave the same on a machine that has fetched the captions files and on one
+// that has not: captions are "off".
+const NO_CAPTIONS = { dir: path.join(os.tmpdir(), `be-there-test-no-captions-${process.pid}`, 'nothing-here') };
+const CAPTIONS_CODE_ID = captionsCodeFrom(fileURLToPath(new URL('../public/js', import.meta.url))).id;
+// What GET /api/config answers on these servers.
+const CONFIG = { iceServers: [{ urls: 'stun:stun.cloudflare.com:3478' }], dropInNoticeSeconds: 8, canonicalOrigin: null, captions: 'off', captionsCode: CAPTIONS_CODE_ID };
 
 // Every file in the repository (but not what is installed, or git's own), with
 // its size and when it was last written: taken now, and compared at the very
@@ -42,7 +52,7 @@ function repositoryFiles() {
 const repositoryBefore = repositoryFiles();
 
 let srv;
-before(async () => { srv = await startServer({ port: 0, store: createStore(':memory:'), setupPassword: 'open-sesame', env: {} }); });
+before(async () => { srv = await startServer({ port: 0, store: createStore(':memory:'), setupPassword: 'open-sesame', env: {}, captions: NO_CAPTIONS }); });
 after(() => srv.close());
 
 const reqOn = (server) => async (path, { token, method = 'GET', body } = {}) => {
@@ -112,11 +122,13 @@ test('pages, scripts and styles are checked with the server every time', async (
 test('/api/config keeps its shape for pages that are already open, and lists STUN only', async () => {
   const config = (await req('/api/config')).body;
   // canonicalOrigin was added with the new address; null means there is none.
-  assert.deepEqual(config, { iceServers: [{ urls: 'stun:stun.cloudflare.com:3478' }], dropInNoticeSeconds: 8, canonicalOrigin: null });
+  // captions and captionsCode were added with live captions.
+  assert.deepEqual(config, { iceServers: [{ urls: 'stun:stun.cloudflare.com:3478' }], dropInNoticeSeconds: 8, canonicalOrigin: null, captions: 'off', captionsCode: CAPTIONS_CODE_ID });
+  assert.match(CAPTIONS_CODE_ID, /^[0-9a-f]{32}$/);
 
   // Even if someone puts a relay and its password in ICE_SERVERS.
   const env = { ICE_SERVERS: JSON.stringify([{ urls: 'stun:stun.example.org:3478' }, { urls: 'turn:relay.example.org:3478', username: 'SECRET-USER', credential: 'SECRET-PASSWORD' }]) };
-  const other = await startServer({ port: 0, store: createStore(':memory:'), setupPassword: '', env });
+  const other = await startServer({ port: 0, store: createStore(':memory:'), setupPassword: '', env, captions: NO_CAPTIONS });
   try {
     const res = await reqOn(other)('/api/config');
     assert.deepEqual(res.body.iceServers, [{ urls: ['stun:stun.example.org:3478'] }]);
@@ -275,7 +287,7 @@ const until = async (check, what = 'condition') => {
 // A server of its own with a fake relay. Homes are made straight in the store,
 // so the tests are not slowed by the limit on creating homes.
 async function world(t, { relay = fakeRelay(), now, env = {}, store = createStore(':memory:') } = {}) {
-  const server = await startServer({ port: 0, store, setupPassword: '', env, relay, ...(now ? { now } : {}) });
+  const server = await startServer({ port: 0, store, setupPassword: '', env, relay, captions: NO_CAPTIONS, ...(now ? { now } : {}) });
   let closed = false;
   const close = async () => { if (!closed) { closed = true; await server.close(); } };
   t.after(close);
@@ -542,7 +554,7 @@ test('relay: credentials never appear in anything served outside the visit', asy
   assert.doesNotMatch((await w.req('/api/visit', { token: v.people[0].token })).text, secret);
   assert.doesNotMatch(JSON.stringify(v.people[1].socket.seen), secret);
   // /api/config still says what it always said.
-  assert.deepEqual((await w.req('/api/config')).body, { iceServers: [{ urls: 'stun:stun.cloudflare.com:3478' }], dropInNoticeSeconds: 8, canonicalOrigin: null });
+  assert.deepEqual((await w.req('/api/config')).body, CONFIG);
 });
 
 test('the organizer sees whether the relay is set up, and can test it', async (t) => {
@@ -692,7 +704,7 @@ test('a visit through the relay leaves nothing in the server’s log', async (t)
 // messages are sent, and a clock the test moves by hand.
 function switchboard({ relay = fakeRelay(), now } = {}) {
   const store = createStore(':memory:');
-  const { onConnection } = createApp({ store, setupPassword: '', env: {}, relay, ...(now ? { now } : {}) });
+  const { onConnection } = createApp({ store, setupPassword: '', env: {}, relay, captions: NO_CAPTIONS, ...(now ? { now } : {}) });
   const sent = [];      // [who, message] in the order the server sent them
   const join = (who, role, token) => {
     const ws = new EventEmitter();
@@ -799,14 +811,14 @@ function raw(server, pathname, headers = {}) {
 
 // What a server started with these options says its new address is.
 async function addressWith(options) {
-  const server = await startServer({ port: 0, store: createStore(':memory:'), setupPassword: '', env: {}, relay: fakeRelay(), ...options });
+  const server = await startServer({ port: 0, store: createStore(':memory:'), setupPassword: '', env: {}, relay: fakeRelay(), captions: NO_CAPTIONS, ...options });
   try {
     const res = await reqOn(server)('/api/config');
     assert.equal(res.status, 200);
     // What pages already open rely on is still there, whatever the address.
     assert.deepEqual(res.body.iceServers, [{ urls: 'stun:stun.cloudflare.com:3478' }]);
     assert.equal(res.body.dropInNoticeSeconds, 8);
-    assert.deepEqual(Object.keys(res.body).sort(), ['canonicalOrigin', 'dropInNoticeSeconds', 'iceServers']);
+    assert.deepEqual(Object.keys(res.body).sort(), ['canonicalOrigin', 'captions', 'captionsCode', 'dropInNoticeSeconds', 'iceServers']);
     assert.equal(server.canonicalOrigin, res.body.canonicalOrigin);
     return { origin: res.body.canonicalOrigin, ignored: server.canonicalIgnored, text: res.text };
   } finally {
@@ -816,7 +828,7 @@ async function addressWith(options) {
 
 test('the new address: there is none until it is switched on', async () => {
   assert.equal((await req('/api/config')).body.canonicalOrigin, null);
-  assert.deepEqual(await addressWith({}), { origin: null, ignored: false, text: JSON.stringify({ iceServers: [{ urls: 'stun:stun.cloudflare.com:3478' }], dropInNoticeSeconds: 8, canonicalOrigin: null }) });
+  assert.deepEqual(await addressWith({}), { origin: null, ignored: false, text: JSON.stringify(CONFIG) });
   for (const empty of ['', '  ']) {
     const found = await addressWith({ env: { CANONICAL_ORIGIN: empty } });
     assert.equal(found.origin, null);
@@ -876,7 +888,7 @@ test('the new address: a test may use an address on this machine, with a list of
 test('both addresses are served alike: 200 for either Host, and never a redirect', async (t) => {
   // With the new address switched on, and with it off.
   for (const env of [{ CANONICAL_ORIGIN: NEW_ADDRESS }, {}]) {
-    const server = await startServer({ port: 0, store: createStore(':memory:'), setupPassword: '', env, relay: fakeRelay() });
+    const server = await startServer({ port: 0, store: createStore(':memory:'), setupPassword: '', env, relay: fakeRelay(), captions: NO_CAPTIONS });
     t.after(() => server.close());
     const { port } = new URL(server.url);
     const hosts = [
@@ -1030,13 +1042,14 @@ const freePort = () => new Promise((resolve, reject) => {
 // Starts the real server as the host does (`node server.js`) and gives back
 // everything it printed while starting. Its data file would go in a folder of
 // its own outside the repository, and it is given none of this machine's
-// settings.
+// settings. Captions are switched off, because the real server would
+// otherwise set about fetching their files from other sites.
 async function startupOutput(extraEnv) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'be-there-test-'));
   try {
     const child = spawn(process.execPath, [fileURLToPath(new URL('../server.js', import.meta.url))], {
       cwd: dir,
-      env: { PATH: process.env.PATH, PORT: String(await freePort()), DATA_FILE: path.join(dir, 'db.json'), ...extraEnv },
+      env: { PATH: process.env.PATH, PORT: String(await freePort()), DATA_FILE: path.join(dir, 'db.json'), CAPTIONS: 'off', ...extraEnv },
       stdio: ['ignore', 'pipe', 'pipe'],
     });
     let out = '';
@@ -1071,6 +1084,21 @@ test('starting the server: one plain line about the new address, and a wrong val
   assert.match(wrong, /^CANONICAL_ORIGIN is set to an address this version does not know, so it is ignored\. Nothing moves\.$/m);
   assert.equal(wrong.match(/CANONICAL_ORIGIN/g).length, 1, 'said once');
   assert.doesNotMatch(wrong, /evil|secret-path|New address/);
+});
+
+test('starting the server: one plain line about captions', async (t) => {
+  const off = await startupOutput({});
+  assert.match(off, /^Captions: off \(CAPTIONS=off\)\.$/m);
+  assert.equal(off.match(/captions/gi).length, 2, 'said once');
+  assert.doesNotMatch(off, /fetch/i, 'and nothing is fetched');
+  // With the files already there and verified, it says so and fetches
+  // nothing. (Only on a machine that has them: `npm run captions:fetch`.)
+  const here = captionsDirFrom({}, { cwd: repository });
+  if (captionsStatus(here) !== 'ready') return t.diagnostic('the captions files are not on this machine: the “ready” line was not tried');
+  const ready = await startupOutput({ CAPTIONS: '', CAPTIONS_DIR: here });
+  assert.match(ready, /^Captions: ready\.$/m);
+  assert.equal(ready.match(/captions/gi).length, 1);
+  assert.doesNotMatch(ready, /fetch/i);
 });
 
 // ---------------------------------------------------------------------------

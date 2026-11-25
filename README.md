@@ -42,6 +42,20 @@ The home screen can show a photo of each visitor in place of their initials: on 
 - **Who can fetch one.** The organizer, and the home screen for its own visitors, each with their link’s secret. A photo is always sent as a JPEG picture and as a download, never as a page.
 - **Photo requests are not a record of visits.** The host can see which addresses are asked for and when. So the home screen fetches a photo once, when it first hears of it or when it changes, and keeps it in memory. It never asks for one because someone knocks or a visit starts or ends. (A fetch that fails is tried again after 1, 5 and 30 minutes, by the clock alone.) Uploads and photo requests are not logged by Be There.
 
+### Captions (a trial)
+
+During a visit the home screen can show, in very large letters, what the visitor is saying, for someone who finds it hard to hear. This is a trial: English only, on the home screen only, and it makes mistakes.
+
+- **Worked out on the tablet itself.** The words are made from the sound the tablet is already playing, by a small speech model that runs in the browser. No sound and no words leave the tablet, nothing is stored, and no outside speech service is involved. The browser's own speech recognition is not used: on iPads it is broken, it cannot listen to a visitor's voice, and it can mute a visit. Nothing is ever read aloud either.
+- **The person at home switches it on.** During a visit there is one large switch, bottom left, that says “Captions off” or “Captions on”. It is off until they switch it on; after that the tablet remembers their choice (that one word, “on” or “off”, is the only thing it keeps) and applies it at the start of each visit. Organizers and visitors cannot switch it, and the visitor's page knows nothing about it.
+- **What they see.** At most three lines above the buttons: finished sentences, and of the sentence being spoken only the words the model has settled on (it looks at a sentence several times while it is spoken, and a word is shown once two looks in a row agree on it), so words on the screen do not rewrite themselves. A finished sentence replaces its line. When captions start, one line says “Captions are on. They can contain mistakes.”
+- **How good.** On clear speech about 1 word in 10 comes out wrong, and short phrases said alone fare worst. Quiet, slurred or accented voices and a television in the room will do worse. It is an aid, not a record of what was said.
+- **How late.** Words appear about a second after they are spoken. If the tablet falls more than about 3 seconds behind, it drops what is waiting, says “Captions paused, catching up”, and carries on from the live sound. The third time in one visit, or if it has not got ready within 90 seconds, captions switch themselves off for that visit with a plain line (“Captions can’t keep up on this tablet.” or “Captions aren’t available on this tablet.”). The visit itself is never touched.
+- **The one-time download.** The speech model and the library that runs it are about 49 MB (roughly 35 MB on the wire where the host compresses them). The tablet fetches them from Be There's own server the first time captions are switched on, shows “Getting captions ready…” with a percentage, and keeps them. After that, starting captions takes a couple of seconds and asks the server for nothing: a captioned visit leaves no more trace with the host than any other.
+- **Try it first: `/captions-check`.** Before relying on captions, open `/captions-check` on the tablet, in the same browser and at the same address as its home screen. “Get ready” fetches the files (so the first visit need not), “Quick test” writes down eleven seconds of sample speech and times it, and “Two-minute test” plays that speech through a video link from the page to itself and captions it exactly as a visit would. It ends with “This device can show captions.” or “Captions would lag on this device.”, and a few lines of numbers to read back. The organizer page has a link to it.
+- **Where the files come from.** They are not in this repository. `lib/captions-files.js` lists each one with the exact address it comes from (a pinned version or revision), its size and its SHA-256. The server fetches them once, in the background, when it starts and does not have them; checks every byte; keeps them in a `captions/v1` folder beside the data file; and serves them itself at `/captions-files/v1/…`. A tablet never asks any other site for anything. Whose work they are is in [THIRD_PARTY.md](THIRD_PARTY.md) (also served at `/third-party`).
+- **The one change to the page rules.** Running the model needs WebAssembly, so the Content Security Policy now has `'wasm-unsafe-eval'` in `script-src`. It allows compiling WebAssembly and nothing else: no `eval`, and every script still comes from Be There's own server.
+
 ### Links and privacy
 
 Each link carries a long random secret after the `#`, which browsers never send to servers. Only a SHA-256 hash of each secret is stored. Removing a visitor, or making a new home screen or organizer link, makes the old link stop working at once. Every page is `noindex` and sends no referrer.
@@ -73,12 +87,15 @@ The setup page (when it is done) and the organizer page (under "Links") carry fo
 ```
 npm install
 npm start            # http://localhost:3000, then open /setup
-npm test             # rules, storage, photos, the relay, the new address and the server's visit flow
+npm test             # rules, storage, photos, the relay, the new address, captions and the server's visit flow
 npm run e2e          # real visits between two Chromium browsers with fake cameras, directly and
                      # through a relay on this machine, a visitor's photo added, changed and
-                     # removed, and pages moving to the new address
-                     # (needs Playwright; takes about a minute and a half)
+                     # removed, captions of a recording of speech, and pages moving to the new
+                     # address (needs Playwright; takes about two and a half minutes)
+npm run captions:fetch   # fetch the captions files (about 51 MB with the sample) and check them
 ```
+
+`npm start` fetches the captions files by itself, in the background, the first time (set `CAPTIONS=off` to stop it). `npm run captions:fetch` does the same ahead of time and says what went wrong if a download fails; it can be run again at any time. `npm test` never fetches anything. `npm run e2e` tries captions only when the files are there, and otherwise prints `captions: SKIPPED`.
 
 `npm install` also brings `node-turn`, a small relay server used only by `npm run e2e`. It is a development dependency: the app never loads it, and a production install (`NODE_ENV=production`, as on Render) leaves it out.
 
@@ -93,6 +110,8 @@ Settings (environment variables):
 | `TURN_KEY_ID` | The relay: the ID of a Cloudflare Realtime TURN key (32 letters and digits). |
 | `TURN_API_TOKEN` | The relay: that key's API token. A secret. |
 | `TURN_TTL_SECONDS` | How long relay credentials last if they are not revoked first (default 43200, which is 12 hours; between 600 and 172800). They are revoked when the visit ends. On a visit that outlasts them the visitor's page fetches newer ones, up to three times. |
+| `CAPTIONS` | Set to `off` to switch captions off altogether: the files are neither fetched nor served, and the home screen shows no switch. Anything else, or unset, leaves them on. |
+| `CAPTIONS_DIR` | Where the captions files are kept (default: a `captions/v1` folder beside the data file; on Render that is `/var/data/captions/v1`, on the disk, so they are fetched once and survive deploys). |
 | `CANONICAL_ORIGIN` | Be There's new address. When set, visitor, organizer and setup pages opened at any other address move to it, and new links point at it (see "The two addresses"). Only `https://bethere.gladspring.org` is accepted; any other value is ignored. Set in `render.yaml`. Leave it unset on a developer's machine. |
 
 The two `TURN_` values are set by hand in the host's settings (on Render: the service's Environment page). They are not in `render.yaml` and must never be committed. Without them, or while they still hold placeholder text, the relay is off: visits connect directly only, and the server says so in one line when it starts.
@@ -108,6 +127,9 @@ Camera and microphone need HTTPS (or `localhost`).
 - **Trying photos for real.** Photos are tested in Chromium with made-up pictures. They still need a first check on an iPhone and an iPad: “Take a photo” and “Choose a photo” on the organizer page (a photo from the library may arrive in a format the page has to turn into a JPEG, or cannot read), and the photo on the home screen’s list, at the door and during a visit.
 - A photo is cut from the middle of the picture. The organizer cannot yet move or zoom it; a picture with the face off to one side needs cropping first.
 - A visitor cannot offer their own photo, and the person at home is not asked before a photo the organizer adds is shown. Both were left out on purpose for now.
-- **Hosting.** It needs HTTPS and storage that survives restarts (a persistent disk, or Postgres in place of the JSON file; photos are files and need the disk either way).
-- **AI help:** live captions, translation, and visit reminders for family.
+- **Trying captions for real.** Nothing about captions has run on an iPhone or iPad. They are tested in Chromium on a developer's machine, with a recording as the visitor's voice. How fast the model is on the owners' tablet, whether the browser lets it run at all (memory), and whether a page there may listen to a visitor's sound are unknown until `/captions-check` has been run on it. On a tablet that cannot do it, captions say so and switch themselves off; the visit is not affected.
+- Captions are English only, on the home screen only, and about 1 word in 10 is wrong on clear speech. They have not been tried with the people they are for.
+- The first time captions are switched on in a visit, the tablet fetches about 49 MB during that visit, unless `/captions-check` was run on it first. On slow broadband that takes a minute or more.
+- **Hosting.** It needs HTTPS and storage that survives restarts (a persistent disk, or Postgres in place of the JSON file; photos and the captions files are files and need the disk either way).
+- **AI help:** translation, and visit reminders for family.
 - A fuller kiosk setup guide for the tablet (today there are the four reminders under "Keeping the tablet ready"); a small robot visitors can drive around the home, later.

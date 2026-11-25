@@ -9,7 +9,12 @@
 // Along the way, visitors' photos: the organizer adds, changes and removes
 // one, the home screen shows it on the list, at the door and during the
 // visit, and every request the home screen makes for a photo is counted.
-// It takes about a minute and a half, a third of it waiting for a visit that
+// And live captions, when the files for them are on this machine (`npm run
+// captions:fetch`): the visitor's browser is given a recording of clear speech
+// as its microphone, captions are switched on at the home screen, and the
+// words must appear there, on the tablet alone: everything the home screen
+// sends during that visit is recorded and searched for them.
+// It takes about two and a half minutes, part of it waiting for a visit that
 // is meant not to connect.
 import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
@@ -17,6 +22,7 @@ import dgram from 'node:dgram';
 import fs from 'node:fs';
 import http from 'node:http';
 import net from 'node:net';
+import os from 'node:os';
 import path from 'node:path';
 import zlib from 'node:zlib';
 import { createRequire } from 'node:module';
@@ -24,6 +30,8 @@ import { fileURLToPath } from 'node:url';
 import { startServer } from '../server.js';
 import { createStore } from '../lib/store.js';
 import { inspectJpeg } from '../lib/jpeg.js';
+import { CAPTIONS_FILES, CAPTIONS_VERSION, captionsDirFrom, captionsStatus } from '../lib/captions-files.js';
+import { parseWav, resample } from '../public/js/caption-text.js';
 
 // Playwright is loaded with require so a globally installed copy works too.
 const require = createRequire(import.meta.url);
@@ -80,12 +88,48 @@ const relay = {
   async revoke(username) { turn.removeUser(username); relay.revoked.push(username); },
 };
 
+// ----- Captions -----
+// Tried only when the files they need are on this machine, fetched and
+// verified. The visitor's "microphone" is then a recording of clear speech
+// (the sample that comes with the captions files: President Kennedy, 1961),
+// which Chromium plays round and round. It wants a 48 kHz, one-channel,
+// 16-bit WAV, made here in a folder of its own outside the repository.
+const captionsDir = captionsDirFrom(process.env, { cwd: fileURLToPath(new URL('..', import.meta.url)) });
+const captionsHere = captionsStatus(captionsDir) === 'ready';
+const scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'be-there-e2e-'));
+function wavFile(file, samples, rate) {
+  const out = Buffer.alloc(44 + samples.length * 2);
+  out.write('RIFF', 0);
+  out.writeUInt32LE(36 + samples.length * 2, 4);
+  out.write('WAVEfmt ', 8);
+  out.writeUInt32LE(16, 16);
+  out.writeUInt16LE(1, 20);
+  out.writeUInt16LE(1, 22);
+  out.writeUInt32LE(rate, 24);
+  out.writeUInt32LE(rate * 2, 28);
+  out.writeUInt16LE(2, 32);
+  out.writeUInt16LE(16, 34);
+  out.write('data', 36);
+  out.writeUInt32LE(samples.length * 2, 40);
+  samples.forEach((value, i) => out.writeInt16LE(Math.max(-32768, Math.min(32767, Math.round(value * 32767))), 44 + i * 2));
+  fs.writeFileSync(file, out);
+  return file;
+}
+let speech = null;
+if (captionsHere) {
+  const sample = parseWav(fs.readFileSync(path.join(captionsDir, 'jfk.wav')));
+  speech = wavFile(path.join(scratch, 'speech-48k-mono.wav'), resample(sample.samples, sample.rate, 48_000), 48_000);
+}
+
 // The pages are told to ask the relay server on this machine for their own
 // address too (it answers STUN as well), in place of Cloudflare's public STUN
 // server, so that no browser here asks anyone outside for anything.
 const env = { ICE_SERVERS: JSON.stringify([{ urls: `stun:127.0.0.1:${turnPort}` }]) };
-const srv = await startServer({ port: 0, store: createStore(':memory:'), setupPassword: '', env, relay });
-const browser = await chromium.launch({ args: ['--use-fake-device-for-media-stream', '--use-fake-ui-for-media-stream', '--autoplay-policy=no-user-gesture-required'] });
+const srv = await startServer({ port: 0, store: createStore(':memory:'), setupPassword: '', env, relay, captions: captionsHere ? { dir: captionsDir } : { off: true } });
+// Every request that reaches this server, from any page, in the order it came.
+const reached = [];
+srv.server.on('request', (req) => reached.push(`${req.method} ${req.url}`));
+const browser = await chromium.launch({ args: ['--use-fake-device-for-media-stream', '--use-fake-ui-for-media-stream', '--autoplay-policy=no-user-gesture-required', ...(speech ? [`--use-file-for-fake-audio-capture=${speech}`] : [])] });
 const step = (s) => console.log(`- ${s}`);
 const until = async (check, what, ms = 10_000) => {
   for (const end = Date.now() + ms; Date.now() < end;) {
@@ -219,7 +263,7 @@ const serverWithNewAddress = async (canonical) => {
   const port = await freeTcpPort();
   const canonicalOrigin = canonical(port);
   const store = createStore(':memory:');
-  const server = await startServer({ port, store, setupPassword: '', env, relay: noRelay, canonicalOrigin, canonicalAllow: [canonicalOrigin] });
+  const server = await startServer({ port, store, setupPassword: '', env, relay: noRelay, canonicalOrigin, canonicalAllow: [canonicalOrigin], captions: { off: true } });
   extras.push(() => server.close());
   return { server, store, old: server.url, canonicalOrigin };
 };
@@ -280,6 +324,13 @@ try {
   // to the end of this run.
   const homePhotoRequests = [];
   home.on('request', (request) => { if (isPhotoRequest(request)) homePhotoRequests.push(`${request.method()} ${new URL(request.url()).pathname}`); });
+  // And, for captions: everything the home screen sends to anyone, from its
+  // first moment on. Every request (its own and its workers'), with what it
+  // carried, and every message on its live connection to the server.
+  const homeRequests = [];
+  const homeFrames = [];
+  homeCtx.on('request', (request) => homeRequests.push({ method: request.method(), url: request.url(), body: request.postData() || '' }));
+  home.on('websocket', (socket) => socket.on('framesent', (frame) => homeFrames.push(String(frame.payload))));
   await home.goto(homeLink);
   // The screen connects without a tap: the organizer sees it is on.
   await org.reload();
@@ -383,6 +434,19 @@ try {
   }, null, { timeout: 20_000 });
   await Promise.all([hasVideo(home), hasVideo(visit)]);
   assert.match(await home.textContent('#with-you-text'), /Sarah is with you/);
+  // Captions are there to be switched on (when this server has them), and
+  // off until Mary does: nothing is listening, and nothing has been fetched.
+  // (The page's own captions script is loaded when the screen opens; what
+  // counts here is the worker, the listener, and the model's files.)
+  const captionsAsked = () => homeRequests.filter((r) => /captions-(files|code)\/|captions-worker|pcm-worklet/.test(r.url)).map((r) => r.url);
+  assert.equal(await home.isVisible('#captions-toggle'), captionsHere);
+  if (captionsHere) {
+    assert.equal(await home.textContent('#captions-toggle'), 'Captions off');
+    assert.equal(await home.getAttribute('#captions-toggle', 'aria-pressed'), 'false');
+  }
+  assert.equal(await home.isVisible('#captions'), false);
+  assert.equal(home.workers().length, 0);
+  assert.deepEqual(captionsAsked(), []);
   // Beside the name, during the visit: the same photo, small.
   const inVisit = await waitForFace(home, '#with-you-photo');
   assert.equal(inVisit.src, onCard.src);
@@ -437,6 +501,7 @@ try {
   assert.equal(await home.isVisible('#call'), false);
   // The camera is released on the home screen when the visit ends.
   assert.equal(await home.evaluate(() => document.querySelector('#local').srcObject), null);
+  assert.equal(await home.isVisible('#captions-toggle'), false);
   step('Mary ended the visit');
 
   // Invited, shown, approved, knocked, answered, ended, and the list drawn
@@ -683,6 +748,302 @@ try {
   assert.equal(homePhotoRequests.length, 2, homePhotoRequests.join(', '));
   assert.deepEqual(visitorPhotoRequests, [], 'Sarah’s phone never asked for anything about a photo');
   step('photos: the home screen made one request for each version, and the visitor’s phone made none');
+
+  // ----- Captions -----
+  if (!captionsHere) {
+    step('captions: SKIPPED (run npm run captions:fetch)');
+  } else {
+    // So far the switch was never touched: the home screen has fetched nothing
+    // for captions and remembers nothing about them.
+    assert.deepEqual(captionsAsked(), [], 'with the switch off, the home screen fetched nothing for captions');
+    assert.equal(await home.evaluate(() => localStorage.getItem('bethere.captions')), null);
+    assert.match(await org.innerText('#content'), /Captions \(trial\): check a device at \/captions-check/);
+    assert.equal(await org.getAttribute('a[href="/captions-check"]', 'href'), '/captions-check');
+
+    const NOTICES = [/^Getting captions ready…/, /^Captions are on\. They can contain mistakes\.$/, /^Captions paused, catching up$/, /^Captions can’t keep up on this tablet\.$/, /^Captions aren’t available on this tablet\.$/, /^Tap the screen to start captions\.$/];
+    const isNotice = (line) => NOTICES.some((notice) => notice.test(line));
+    // Every line the caption box ever shows is noted, inside the page.
+    await home.evaluate(() => {
+      window.captionLines = [];
+      const box = document.querySelector('#captions');
+      new MutationObserver(() => { for (const line of box.children) if (!window.captionLines.includes(line.textContent)) window.captionLines.push(line.textContent); }).observe(box, { childList: true });
+    });
+    const captionsShown = async () => (await home.evaluate(() => window.captionLines)).filter((line) => !isNotice(line));
+    const wordsOn = (page, pattern, ms = 60_000) => page.waitForFunction((source) => [...document.querySelectorAll('#captions:not([hidden]):not(.is-status) p')].some((line) => new RegExp(source, 'i').test(line.textContent)), pattern, { timeout: ms });
+    const boxIsEmpty = (page) => page.evaluate(() => { const box = document.querySelector('#captions'); return box.hidden && box.childElementCount === 0 && box.textContent === ''; });
+    const toggleSays = async (text, pressed) => {
+      assert.equal(await home.textContent('#captions-toggle'), text);
+      assert.equal(await home.getAttribute('#captions-toggle', 'aria-pressed'), pressed);
+    };
+    const overlap = (a, b) => a.left < b.right && b.left < a.right && a.top < b.bottom && b.top < a.bottom;
+    const measure = () => home.evaluate(() => {
+      const rect = (selector) => { const r = document.querySelector(selector).getBoundingClientRect(); return { left: r.left, right: r.right, top: r.top, bottom: r.bottom, width: r.width, height: r.height }; };
+      const box = document.querySelector('#captions');
+      const style = getComputedStyle(box);
+      const lines = [...box.children].map((line) => { const r = line.getBoundingClientRect(); return { top: r.top, bottom: r.bottom }; });
+      return {
+        captions: rect('#captions'), toggle: rect('#captions-toggle'), end: rect('#end'), label: rect('#with-you'), self: rect('#local'), screen: { width: innerWidth, height: innerHeight }, lines,
+        color: style.color, background: style.backgroundColor, weight: Number(style.fontWeight), size: parseFloat(style.fontSize), lineHeight: parseFloat(style.lineHeight),
+      };
+    });
+    // How strongly two colours stand apart, as the accessibility guidelines measure it (7 or more is their highest grade).
+    const contrast = (one, two) => {
+      const light = (colour) => { const [r, g, b] = colour.match(/\d+/g).map((v) => { const c = Number(v) / 255; return c <= 0.03928 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4; }); return 0.2126 * r + 0.7152 * g + 0.0722 * b; };
+      const [hi, lo] = [light(one), light(two)].sort((a, b) => b - a);
+      return (hi + 0.05) / (lo + 0.05);
+    };
+
+    // Mary opens visits again, and Sarah comes in.
+    await home.click('#pause');
+    const first = { requests: homeRequests.length, frames: homeFrames.length, reached: reached.length };
+    await startVisit(visit2);
+    await Promise.all([hasVideo(home), hasVideo(visit2)]);
+    await toggleSays('Captions off', 'false');
+    assert.equal(await boxIsEmpty(home), true);
+    // What the page and its messages hold before any caption: words found
+    // here too cannot be told apart from captions, and are left out below.
+    const before = `${homeFrames.join('\n')}\n${await home.evaluate(() => document.documentElement.outerHTML)}`.toLowerCase();
+
+    // Mary switches captions on.
+    const switchedOn = Date.now();
+    await home.click('#captions-toggle');
+    await toggleSays('Captions on', 'true');
+    await home.waitForFunction(() => /^Getting captions ready…|^Captions are on\./.test(document.querySelector('#captions').textContent));
+    await home.waitForFunction(() => document.querySelector('#captions.is-status')?.textContent === 'Captions are on. They can contain mistakes.', null, { timeout: 60_000 });
+    const readyAfter = Date.now() - switchedOn;
+    await snap(home, '20-home-captions-are-on');
+    // The visitor's words appear on the home screen. (The recording says
+    // "…ask what you can do for your country.")
+    await wordsOn(home, 'country');
+    const wordsAfter = Date.now() - switchedOn;
+    assert.equal(home.workers().length, 1);
+    assert.match(home.workers()[0].url(), /\/captions-code\/[0-9a-f]{32}\/captions-worker\.js$/);
+
+    // Where they are, and how they look: above the two buttons, clear of the
+    // name and red light, large, bold, white on near-black, three lines at most.
+    const look = await measure();
+    for (const other of ['toggle', 'end', 'label', 'self']) assert.equal(overlap(look.captions, look[other]), false, `the captions do not cover ${other}: ${JSON.stringify([look.captions, look[other]])}`);
+    assert.equal(overlap(look.toggle, look.end), false);
+    assert.ok(look.captions.bottom <= look.toggle.top && look.captions.bottom <= look.end.top, 'the captions are above the buttons');
+    assert.ok(look.captions.top > look.label.bottom, 'and below the name');
+    assert.equal(look.toggle.height, look.end.height, 'the switch is as tall as “End visit”');
+    assert.ok(look.toggle.height >= 88);
+    assert.ok(look.toggle.left <= 20 && look.toggle.bottom === look.end.bottom, 'the switch is in the bottom left corner');
+    assert.ok(Math.abs((look.end.left + look.end.right) / 2 - look.screen.width / 2) <= 1, '“End visit” is still in the middle');
+    assert.deepEqual([look.color, look.background], ['rgb(255, 255, 255)', 'rgb(17, 17, 17)']);
+    assert.ok(contrast(look.color, look.background) >= 7, 'white on near-black');
+    assert.ok(look.weight >= 700 && look.size >= 40, `large and bold: ${look.size}px, ${look.weight}`);
+    // (Its edge is 0.35 of the letter size, above and below.)
+    assert.ok(look.captions.height <= 3 * look.lineHeight + 0.7 * look.size + 1, 'three lines at most');
+    for (const part of ['captions', 'toggle', 'end']) assert.ok(look[part].left >= 0 && look[part].right <= look.screen.width && look[part].bottom <= look.screen.height, `${part} is on the screen`);
+    await home.waitForTimeout(5000);
+    await snapAll(home, '21-home-captions-on');
+
+    // The promise: the words stay on the tablet. Every line the box showed,
+    // and each longer word in those lines, is searched for in everything the
+    // home screen sent since the visit began.
+    const shownLines = await captionsShown();
+    assert.ok(shownLines.some((line) => /country/i.test(line)), shownLines.join(' | '));
+    const said = [...new Set(shownLines.flatMap((line) => [line, ...line.split(/\s+/).map((word) => word.replace(/[^\p{L}']/gu, '')).filter((word) => word.length >= 5)]))]
+      .map((text) => text.toLowerCase()).filter((text) => !before.includes(text));
+    assert.ok(said.includes('country') && said.length >= 2, said.join(' | '));
+    const carries = (text) => said.find((word) => String(text).toLowerCase().includes(word));
+    const framesSent = homeFrames.slice(first.frames);
+    assert.ok(framesSent.some((frame) => frame.includes('"answer"')) && framesSent.some((frame) => frame.includes('"signal"')), 'the visit’s own messages were recorded');
+    for (const frame of framesSent) assert.equal(carries(frame), undefined, 'a message to the server carries caption words');
+    const requestsSent = homeRequests.slice(first.requests);
+    assert.ok(requestsSent.length >= 12, 'the captions files were fetched in this visit');
+    for (const request of requestsSent) {
+      // Only fetching: the scripts and the model, from this server, with nothing sent along.
+      assert.equal(request.method, 'GET', request.url);
+      assert.equal(request.body, '');
+      assert.ok(request.url.startsWith(`${srv.url}/captions-code/`) || request.url.startsWith(`${srv.url}/captions-files/${CAPTIONS_VERSION}/`), request.url);
+      assert.equal(carries(decodeURIComponent(request.url)), undefined);
+    }
+    // And nothing is stored but the switch itself; what the tablet keeps for
+    // captions is the model's own files.
+    const kept = await home.evaluate(async () => ({
+      local: Object.fromEntries(Object.entries(localStorage)),
+      session: Object.keys(sessionStorage),
+      databases: ((await indexedDB.databases?.()) || []).map((database) => database.name),
+      cookies: document.cookie,
+      caches: Object.fromEntries(await Promise.all((await caches.keys()).map(async (name) => [name, (await (await caches.open(name)).keys()).map((request) => new URL(request.url).pathname)]))),
+    }));
+    assert.deepEqual(Object.keys(kept.local).sort(), ['bethere.captions', 'bethere.home']);
+    assert.equal(kept.local['bethere.captions'], 'on');
+    assert.equal(kept.local['bethere.home'], new URL(homeLink).hash.slice(1), 'the home screen’s own link, as before');
+    assert.deepEqual([kept.session, kept.databases, kept.cookies], [[], [], '']);
+    assert.deepEqual(Object.keys(kept.caches), [`bethere-captions-${CAPTIONS_VERSION}`]);
+    const listed = CAPTIONS_FILES.map((f) => `/captions-files/${CAPTIONS_VERSION}/${f.path}`);
+    assert.ok(kept.caches[`bethere-captions-${CAPTIONS_VERSION}`].length >= 9);
+    for (const pathname of kept.caches[`bethere-captions-${CAPTIONS_VERSION}`]) assert.ok(listed.includes(pathname), `kept on the tablet: ${pathname}`);
+    assert.equal((await homeCtx.cookies()).length, 0);
+
+    // Mary ends the visit: the words are gone, and so is the worker.
+    await home.click('#end');
+    await visit2.waitForSelector('#lobby:not([hidden])');
+    assert.equal(await boxIsEmpty(home), true);
+    assert.equal(await home.isVisible('#captions-toggle'), false);
+    await until(() => home.workers().length === 0, 'the captions worker to be ended');
+    assert.equal(carries(await home.evaluate(() => document.documentElement.outerHTML)), undefined, 'no caption words are left anywhere on the page');
+    for (const frame of homeFrames.slice(first.frames)) assert.equal(carries(frame), undefined);
+    step(`captions: switched on at the home screen, ready after ${(readyAfter / 1000).toFixed(1)} s, the visitor’s words on the screen after ${(wordsAfter / 1000).toFixed(1)} s (“${shownLines.find((line) => /country/i.test(line))}”)`);
+    step(`captions: none of ${said.length} caption words or lines is in any of the ${framesSent.length} messages or ${requestsSent.length} requests the home screen sent; nothing stored but the switch; box empty and worker gone after “End visit”`);
+
+    // The next visit: Mary's choice is remembered, with no tap. And now that
+    // the tablet has the files, the visit asks the server for nothing at all.
+    const second = { requests: homeRequests.length, frames: homeFrames.length, reached: reached.length };
+    await startVisit(visit2);
+    await home.waitForSelector('#call:not([hidden])');
+    await toggleSays('Captions on', 'true');
+    await Promise.all([hasVideo(home), hasVideo(visit2)]);
+    await wordsOn(home, 'country');
+    const askedOfServer = reached.slice(second.reached).filter((request) => request !== 'GET /api/organize');
+    assert.deepEqual(askedOfServer, [], 'a captioned visit, once the tablet has the files, asks the server for nothing');
+    for (const frame of homeFrames.slice(second.frames)) assert.equal(carries(frame), undefined);
+    // Mary switches them off in the middle of the visit: the words and the
+    // worker go at once, the choice is remembered, and the visit carries on.
+    await home.click('#captions-toggle');
+    await toggleSays('Captions off', 'false');
+    assert.equal(await boxIsEmpty(home), true);
+    await until(() => home.workers().length === 0, 'the captions worker to be ended');
+    assert.equal(await home.evaluate(() => localStorage.getItem('bethere.captions')), 'off');
+    const playedTo = await home.evaluate(() => document.querySelector('#remote').currentTime);
+    await home.waitForTimeout(700);
+    assert.ok(await home.evaluate(() => document.querySelector('#remote').currentTime) > playedTo, 'the visit carries on');
+    assert.equal(await visit2.isVisible('#call'), true);
+    // And on again.
+    await home.click('#captions-toggle');
+    await toggleSays('Captions on', 'true');
+    await wordsOn(home, '\\w');
+    assert.equal(await home.evaluate(() => localStorage.getItem('bethere.captions')), 'on');
+    await home.click('#end');
+    await visit2.waitForSelector('#lobby:not([hidden])');
+    await until(() => home.workers().length === 0, 'the captions worker to be ended');
+    assert.equal(await boxIsEmpty(home), true);
+    step('captions: remembered on the next visit, which asked the server for nothing; switched off and on again mid-visit without disturbing it');
+
+    // What Mary sees when captions have something to say about themselves,
+    // and when they fail. For this the real worker is put aside for one that
+    // says what the test tells it to; the page around it is the real one.
+    await home.evaluate(() => {
+      window.RealWorker = window.Worker;
+      window.Worker = class { constructor(url) { this.url = url; this.heard = []; window.pretendWorker = this; } postMessage(message) { this.heard.push(message.type); } terminate() { this.ended = true; } };
+    });
+    const pretend = (message) => home.evaluate((m) => window.pretendWorker.onmessage({ data: m }), message);
+    const boxSays = (text, ms = 10_000) => home.waitForFunction((t) => { const box = document.querySelector('#captions'); return !box.hidden && box.textContent === t; }, text, { timeout: ms });
+    await startVisit(visit2);
+    await Promise.all([hasVideo(home), hasVideo(visit2)]);
+    await boxSays('Getting captions ready…');
+    await pretend({ type: 'progress', percent: 42, fetching: true });
+    await boxSays('Getting captions ready… 42%');
+    await snapAll(home, '22a-home-captions-getting-ready');
+    await pretend({ type: 'ready', loadMs: 1, fetchedBytes: 0 });
+    await boxSays('Captions are on. They can contain mistakes.');
+    await snapAll(home, '22b-home-captions-notice');
+    // More words than three lines hold: the newest stay in view, whole, and
+    // the oldest leave from the top.
+    await pretend({ type: 'caption', kind: 'final', id: 1, text: 'Hello Mary, it is Sarah. I thought I would look in on you before lunch today.' });
+    await pretend({ type: 'caption', kind: 'final', id: 2, text: 'The children send their love, and Tom says he will telephone on Sunday afternoon.' });
+    await pretend({ type: 'caption', kind: 'partial', id: 3, text: 'Shall I bring the photographs when I come on Thursday' });
+    const full = await measure();
+    assert.ok(full.captions.height <= 3 * full.lineHeight + 0.7 * full.size + 1, `three lines at most: ${full.captions.height}px of ${full.lineHeight}px lines`);
+    assert.ok(full.captions.height >= 3 * full.lineHeight, 'and all three are used');
+    assert.equal(full.lines.length, 3);
+    assert.ok(full.lines.at(-1).bottom <= full.captions.bottom && full.lines.at(-1).top >= full.captions.top, 'the newest line is in view');
+    assert.ok(full.lines[0].top < full.captions.top, 'the oldest words have left from the top');
+    for (const other of ['toggle', 'end', 'label', 'self']) assert.equal(overlap(full.captions, full[other]), false, `full of words, the captions still do not cover ${other}`);
+    await snapAll(home, '22c-home-captions-three-lines');
+    // A tablet held upright: still nothing on top of anything else.
+    await home.setViewportSize({ width: 810, height: 1080 });
+    const upright = await measure();
+    for (const [a, b] of [['captions', 'toggle'], ['captions', 'end'], ['captions', 'label'], ['captions', 'self'], ['toggle', 'end']]) assert.equal(overlap(upright[a], upright[b]), false, `upright: ${a} and ${b}`);
+    assert.equal(upright.toggle.height, upright.end.height);
+    await home.setViewportSize({ width: 1180, height: 820 });
+    // Fallen behind: the old words go, and a plain line says why.
+    await pretend({ type: 'paused' });
+    await boxSays('Captions paused, catching up');
+    await snapAll(home, '22d-home-captions-paused');
+    // Caught up: the line stays until there are words again.
+    await pretend({ type: 'resumed' });
+    await home.waitForTimeout(300);
+    assert.equal(await home.textContent('#captions'), 'Captions paused, catching up');
+    await pretend({ type: 'caption', kind: 'partial', id: 4, text: 'There you are' });
+    await boxSays('There you are');
+    // It cannot keep up: captions stop themselves, the switch goes off by
+    // itself, a plain line says so for a while, and the visit is untouched.
+    await pretend({ type: 'error', code: 'too_slow', message: 'Fell too far behind the sound, three times.' });
+    await boxSays('Captions can’t keep up on this tablet.');
+    await toggleSays('Captions off', 'false');
+    assert.equal(await home.evaluate(() => window.pretendWorker.ended), true);
+    assert.deepEqual(await home.evaluate(() => [...new Set(window.pretendWorker.heard)]), ['load', 'audio'], 'the worker was only ever sent the request to load, and sound');
+    assert.equal(await home.evaluate(() => localStorage.getItem('bethere.captions')), 'on', 'her choice is still remembered');
+    await snapAll(home, '22e-home-captions-cannot-keep-up');
+    assert.equal(await home.isVisible('#call'), true);
+    assert.equal(await visit2.isVisible('#call'), true);
+    const stillPlaying = await home.evaluate(() => document.querySelector('#remote').currentTime);
+    await home.waitForFunction(() => document.querySelector('#captions').hidden, null, { timeout: 12_000 });
+    assert.ok(await home.evaluate(() => document.querySelector('#remote').currentTime) > stillPlaying, 'the visit carries on');
+    assert.match(await home.textContent('#with-you-text'), /Sarah is with you/);
+    await home.click('#end');
+    await visit2.waitForSelector('#lobby:not([hidden])');
+    // And a tablet on which captions cannot even start.
+    await startVisit(visit2);
+    await Promise.all([hasVideo(home), hasVideo(visit2)]);
+    await boxSays('Getting captions ready…');
+    await home.evaluate(() => window.pretendWorker.onerror({ message: 'could not be loaded', preventDefault() {} }));
+    await boxSays('Captions aren’t available on this tablet.');
+    await toggleSays('Captions off', 'false');
+    await snapAll(home, '22f-home-captions-not-available');
+    assert.equal(await visit2.isVisible('#call'), true);
+    await visit2.click('#end');
+    await home.waitForSelector('#idle:not([hidden])');
+    assert.equal(await boxIsEmpty(home), true);
+    await home.evaluate(() => { window.Worker = window.RealWorker; });
+    // All through, the home screen asked only this server for anything.
+    // (A photo it already holds in memory is shown from a "blob:" address of its own.)
+    assert.deepEqual(homeRequests.filter((request) => !request.url.startsWith(`${srv.url}/`) && !request.url.startsWith(`blob:${srv.url}/`)).map((request) => request.url), []);
+    step('captions: “getting ready”, the notice, three lines at most, “paused”, “can’t keep up” and “aren’t available” each said in plain words; the visit went on every time');
+
+    // ----- The captions check page -----
+    // What a family opens on the tablet before relying on captions. Here on
+    // a phone-sized screen, with a 20-second long test instead of two minutes.
+    const checkCtx = await browser.newContext({ viewport: { width: 390, height: 844 } });
+    const checkAsked = [];
+    checkCtx.on('request', (request) => checkAsked.push(request.url()));
+    const check = await checkCtx.newPage();
+    await check.goto(`${srv.url}/captions-check?seconds=20`);
+    await check.waitForFunction(() => !document.querySelector('#step1').disabled);
+    assert.equal(await check.isDisabled('#step2'), true);
+    assert.equal(await check.isDisabled('#step3'), true);
+    assert.equal(await check.textContent('#verdict'), 'Not tried yet.');
+    await snapAll(check, '23-captions-check-start');
+    await check.click('#step1');
+    await check.waitForFunction(() => /^Ready\.|could not/.test(document.querySelector('#result1').textContent), null, { timeout: 60_000 });
+    assert.match(await check.textContent('#result1'), /^Ready\. It took [\d.]+ seconds, and 48\.6 MB were fetched\.$/);
+    await check.click('#step2');
+    await check.waitForFunction(() => /^It wrote|could not/.test(document.querySelector('#result2').textContent), null, { timeout: 60_000 });
+    const quick = await check.textContent('#result2');
+    assert.match(quick, /^It wrote: “[^”]*country[^”]*” That took [\d.]+ seconds for 11 seconds of speech: fast enough\.$/i);
+    assert.match(await check.textContent('#verdict'), /^This device can show captions\. \(That is from the quick test/);
+    await snapAll(check, '24-captions-check-after-quick-test');
+    await check.click('#step3');
+    await wordsOn(check, '\\w');
+    await snap(check, '25-captions-check-long-test-running');
+    await check.waitForFunction(() => /^Done\.|stopped|could not/.test(document.querySelector('#result3').textContent), null, { timeout: 90_000 });
+    assert.match(await check.textContent('#result3'), /^Done\. Words appeared about [\d.]+ seconds after they were spoken \([\d.]+ at worst\)\. Captions ran [\d.]+ seconds behind the sound \([\d.]+ at worst\), and never had to pause to catch up\.$/);
+    assert.equal(await check.textContent('#verdict'), 'This device can show captions.');
+    const numbers = await check.textContent('#numbers');
+    assert.match(numbers, /^Got ready in [\d.]+ s \(48\.6 MB fetched\)\nQuick test: [\d.]+ s for 11\.0 s of speech \(0\.\d\d of its length\)\nIt wrote: .*country.*\nLong test: 20 s, \d+ sentences, 0 pauses to catch up\nWords after speech: usually [\d.]+ s, at worst [\d.]+ s\nBehind the sound: usually [\d.]+ s, at worst [\d.]+ s\nSound: \d+ Hz, \d+ blocks heard, loudest 0\.\d+\nBrowser: Mozilla.*$/i);
+    await until(() => check.workers().length === 0, 'the check page’s worker to be ended');
+    assert.equal(await boxIsEmpty(check), true);
+    assert.deepEqual(checkAsked.filter((url) => !url.startsWith(`${srv.url}/`)), [], 'the check page asked only this server for anything');
+    assert.deepEqual(await check.evaluate(() => [Object.keys(localStorage), Object.keys(sessionStorage)]), [[], []]);
+    await snapAll(check, '26-captions-check-done');
+    const line = (start) => numbers.split('\n').find((text) => text.startsWith(start));
+    step(`the captions check page: ${line('Quick test')}; ${line('Words after speech')}; ${line('Behind the sound')}; no pauses`);
+    await checkCtx.close();
+  }
 
   // ----- The new address -----
   const hasVideoOn = (...pages) => Promise.all(pages.map(hasVideo));
@@ -954,6 +1315,7 @@ try {
   await srv.close();
   for (const stop of extras) await stop().catch(() => {});
   turn.stop();
+  fs.rmSync(scratch, { recursive: true, force: true });
 }
 // The little relay server keeps timers of its own running for some minutes
 // after a visit; don't wait for them.

@@ -2,7 +2,10 @@
 // Large, calm, and theirs to control: who may visit, whether anyone may come
 // straight in, pausing visits, and ending any visit with one tap. A red light
 // and their visitor's name show for the whole of every visit.
-import { $, el, initials, rememberedToken, forgetToken, connect, getCamera, stopStream, unlockSound, chime } from './common.js';
+import { $, el, initials, rememberedToken, forgetToken, connect, getCamera, stopStream, unlockSound, chime, api, getConfig } from './common.js';
+// Read as a whole, so that a newer name (soundContext) is simply missing, not
+// an error, if a browser pairs this file with a common.js it kept from before.
+import * as shared from './common.js';
 import { startCall } from './peer.js';
 import { getPhotoUrl, cachedPhotoUrl, keepOnlyPhotos, photoFetcher, showFace, createFaces } from './photo.js';
 
@@ -116,6 +119,111 @@ function showNote(text) {
   if (text) noteTimer = setTimeout(() => showNote(''), 60_000);
 }
 
+// ----- Captions (a trial) -----
+// During a visit the screen can show, in large letters, what the visitor is
+// saying, for someone who finds it hard to hear. The words are worked out on
+// this tablet from the sound it is already playing (captions.js): no sound
+// and no words leave it, and none are kept. Captions are off until the person
+// at home switches them on; that choice is remembered here, so they need not
+// do it at every visit. Whatever goes wrong with captions, the visit carries
+// on untouched.
+//
+// Whether the server has captions is asked when the screen opens (and, while
+// the server is still getting them ready, again by the clock): never because
+// a visit starts.
+let captionsKit = null;       // captions.js, once we know captions can run here
+let captionsCodeAt = '/js';
+let captions = null;          // the captions of the visit in progress, while they are on
+let captionView = { state: 'off', lines: [] };
+let captionLineTimer = null;
+const CAPTION_CHECKS = { every: 2 * 60_000, most: 30 };
+
+function learnCaptions(tries = 0) {
+  const again = () => { if (tries < CAPTION_CHECKS.most) setTimeout(() => learnCaptions(tries + 1), CAPTION_CHECKS.every); };
+  (tries ? api('/api/config') : getConfig()).then(async (config) => {
+    if (config?.captions === 'off') return;
+    if (config?.captions !== 'ready') return again();
+    const kit = await import('./captions.js');
+    if (!kit.captionsSupported()) return;
+    captionsCodeAt = kit.captionsCodeAt(config.captionsCode);
+    captionsKit = kit;
+    offerCaptions();
+  }).catch(again);
+}
+
+function drawCaptions() {
+  const toggle = $('#captions-toggle');
+  toggle.textContent = captions ? 'Captions on' : 'Captions off';
+  toggle.setAttribute('aria-pressed', String(!!captions));
+  toggle.classList.toggle('on', !!captions);
+  captionsKit?.showCaptions($('#captions'), captionView);
+}
+
+// A visit is on the screen: show the switch, and switch captions on if that
+// is what they chose last time.
+function offerCaptions() {
+  if (!captionsKit || !call || $('#call').hidden) return;
+  $('#captions-toggle').hidden = false;
+  if (!captions && captionsKit.captionsRemembered()) captionsOn();
+  drawCaptions();
+}
+
+function captionsOn() {
+  if (captions || !captionsKit) return;
+  clearTimeout(captionLineTimer);
+  captionView = { state: 'loading', lines: [] };
+  let mine = null;
+  const during = (fn) => (...args) => { if (mine && captions === mine) fn(...args); };
+  try {
+    mine = captionsKit.startCaptions({
+      remoteStream: $('#remote').srcObject,
+      audioContext: shared.soundContext?.() || null,
+      codeAt: captionsCodeAt,
+      onUpdate: during((lines) => { captionView = { ...captionView, lines }; drawCaptions(); }),
+      onStatus: during((state, info) => {
+        captionView = { ...captionView, state, percent: info?.percent };
+        // Captions could not run, or could not keep up: they have stopped
+        // themselves. The switch goes off, and a plain line says why for a
+        // little while. The visit carries on.
+        if (state === 'too_slow' || state === 'unavailable') {
+          captions = null;
+          captionLineTimer = setTimeout(() => { captionView = { state: 'off', lines: [] }; drawCaptions(); }, 8000);
+        }
+        drawCaptions();
+      }),
+    });
+    captions = mine;
+  } catch {
+    captions = null;
+    captionView = { state: 'off', lines: [] };
+  }
+}
+
+function captionsOff() {
+  clearTimeout(captionLineTimer);
+  const mine = captions;
+  captions = null;
+  captionView = { state: 'off', lines: [] };
+  try { mine?.stop(); } catch { /* nothing to stop */ }
+}
+
+// The visit is over: stop listening, end the worker, take the words away.
+function endCaptions() {
+  captionsOff();
+  $('#captions-toggle').hidden = true;
+  drawCaptions();
+}
+
+$('#captions-toggle').addEventListener('click', () => {
+  if (!captionsKit) return;
+  const on = !captions;
+  captionsKit.rememberCaptions(on);
+  if (on) captionsOn(); else captionsOff();
+  drawCaptions();
+});
+// Some browsers let a page listen to sound only after a tap: any tap will do.
+document.addEventListener('pointerdown', () => { try { captions?.nudge(); } catch { /* not listening */ } });
+
 // ----- Someone knocks -----
 function showKnock({ visitorId, name, mode, notice }) {
   showNote('');
@@ -174,11 +282,17 @@ async function answer() {
   $('#with-you-text').textContent = `${name} is with you`;
   $('#call').hidden = false;
   $('#idle').hidden = true;
+  try { offerCaptions(); } catch { /* the visit goes on without captions */ }
   const mine = startCall({
     role: 'home',
     stream,
     link,
-    onRemote: (remote) => { const v = $('#remote'); if (v.srcObject !== remote) v.srcObject = remote; },
+    onRemote: (remote) => {
+      const v = $('#remote');
+      if (v.srcObject !== remote) v.srcObject = remote;
+      // Captions listen to the visitor's sound once it is playing here.
+      try { captions?.listenTo(remote); } catch { /* the visit goes on without captions */ }
+    },
     // The video never connected, or was lost for good: back to the clock,
     // with a few plain words. Nothing else about the connection is shown here.
     onState: (state) => { if (state === 'no_connection' && peer === mine) couldNotConnect(); },
@@ -206,6 +320,7 @@ function couldNotConnect() {
 
 function endLocal() {
   hideKnock();
+  try { endCaptions(); } catch { /* nothing was on */ }
   peer?.close();
   peer = null;
   stopStream(stream);
@@ -268,6 +383,7 @@ function start() {
       else showProblem('This link no longer works', 'Ask your family for the new home screen link.');
     },
   });
+  learnCaptions();
   // Keep the screen awake while Be There is open, where the browser allows it.
   const wake = () => navigator.wakeLock?.request('screen').catch(() => {});
   wake();

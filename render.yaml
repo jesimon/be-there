@@ -1,6 +1,11 @@
 # Render Blueprint for Be There: one web service with a small persistent disk
-# for its data file and visitors' photos (a "photos" folder beside the data
-# file). Pushing to main deploys automatically.
+# for its data file, visitors' photos (a "photos" folder beside the data
+# file) and the files live captions need (a "captions" folder beside it too:
+# about 51 MB, fetched by the server once and kept across deploys). Pushing
+# to main deploys automatically.
+#
+# Captions are a trial and are on unless CAPTIONS is set to "off" on the
+# service's Environment page.
 services:
   - type: web
     name: be-there
