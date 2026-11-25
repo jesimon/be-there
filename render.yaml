@@ -9,6 +9,11 @@ services:
     startCommand: npm start
     healthCheckPath: /healthz
     autoDeploy: true
+    # The app's own address. DNS: a CNAME for "bethere" at Cloudflare pointing to
+    # the service's onrender.com host, set to "DNS only". The onrender.com
+    # address keeps working too.
+    domains:
+      - bethere.gladspring.org
     disk:
       name: be-there-data
       mountPath: /var/data
