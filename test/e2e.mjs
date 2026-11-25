@@ -389,6 +389,29 @@ try {
   assert.deepEqual(inVisit.shown, [44, 44]);
   assert.equal(await home.evaluate(() => { const label = document.querySelector('#with-you'); return [...label.children].map((node) => node.id || node.className).join(' '); }), 'live-dot with-you-photo with-you-text', 'red light, photo, name');
   assert.equal(await visit.locator('img').count(), 0, 'the visitor’s page shows no photo');
+  // The photo takes room the name used to have. However long the name, the
+  // red light, the photo and the whole name stay on the screen: a long one
+  // goes onto a second line. Tried on a tablet held upright, with a name about
+  // as long as a visitor can be given (59 letters of the 60 allowed); the
+  // label's own words are put back after.
+  await home.setViewportSize({ width: 810, height: 1080 });
+  const label = await home.evaluate(() => {
+    const text = document.querySelector('#with-you-text');
+    const was = text.textContent;
+    const measure = () => Object.fromEntries(['.live-dot', '#with-you-photo', '#with-you-text'].map((part) => {
+      const box = document.querySelector(`#with-you ${part}`).getBoundingClientRect();
+      return [part, { left: Math.round(box.left), right: Math.round(box.right), width: Math.round(box.width), height: Math.round(box.height) }];
+    }));
+    const usual = measure();
+    text.textContent = 'Great-grandmother Wilhelmina Featherstonehaugh-Cholmondeley is with you';
+    const long = measure();
+    text.textContent = was;
+    return { usual, long, screen: window.innerWidth };
+  });
+  for (const [part, box] of Object.entries(label.long)) assert.ok(box.left >= 0 && box.right <= label.screen, `beside a very long name, ${part} is still on the screen: ${JSON.stringify(box)}`);
+  assert.deepEqual([label.long['.live-dot'].width, label.long['#with-you-photo'].width], [18, 44], 'the red light and the photo are not squeezed');
+  assert.ok(label.long['#with-you-text'].height > label.usual['#with-you-text'].height, 'the long name went onto a second line');
+  await home.setViewportSize({ width: 1180, height: 820 });
   await home.waitForTimeout(800);
   await snap(home, '7-home-in-visit');
   await snap(visit, '8-visitor-in-visit');

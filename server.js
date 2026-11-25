@@ -205,7 +205,10 @@ export function createApp({
     if (!Buffer.isBuffer(req.body)) return res.status(415).json({ error: 'A photo must be sent as a JPEG picture.' });
     const photo = acceptPhoto(req.body);
     if (!photo.ok) return res.status(400).json({ error: 'That picture couldn’t be used. Please try another photo.', reason: photo.reason });
-    store.setPhoto(req.home, req.visitor.id, photo.bytes, photo.etag);
+    // The picture took a while to arrive, and the organizer was let in before
+    // it did. If the visitor was removed or the home deleted meanwhile,
+    // nothing is kept and nobody is told of a photo.
+    if (!store.setPhoto(req.home, req.visitor.id, photo.bytes, photo.etag)) return res.status(404).json({ error: 'No such visitor.' });
     changed(req.home);
     res.json({ photo: photo.etag });
   });

@@ -201,6 +201,12 @@ test('removing a visitor removes their photo, and deleting a home removes its fo
   assert.equal(fs.existsSync(path.join(photosDir, home.id)), false);
   assert.deepEqual(filesIn(photosDir), [path.join(next.id, `${ann.id}.jpg`)], 'the other home is untouched');
   assert.ok(store.photoBytes(next, ann.id).equals(picture.bytes));
+  // Nor can anyone in a home that has been deleted, by a caller that still
+  // holds it: the folder is gone, and nothing would clear the file away again.
+  assert.equal(store.setPhoto(home, tom.id, other.bytes, other.etag), null);
+  assert.equal(fs.existsSync(path.join(photosDir, home.id)), false);
+  assert.deepEqual(filesIn(photosDir), [path.join(next.id, `${ann.id}.jpg`)]);
+  assert.equal(store.photoBytes(home, tom.id), null, 'and nothing is given out for it');
 });
 
 test('a photo that cannot be written leaves the record as it was; one that cannot be cleared away stops nothing', () => {

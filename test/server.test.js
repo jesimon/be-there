@@ -1473,6 +1473,35 @@ test('photos: kept as one small file beside the data file; gone when the photo, 
   assert.deepEqual(fs.readdirSync(dir).sort(), ['db.json', 'photos']);
 });
 
+test('photos: a tag whose picture is no longer on the disk is “no photo”, and the organizer can put it right', async (t) => {
+  const written = [];
+  for (const method of ['log', 'info', 'warn', 'error']) t.mock.method(console, method, (...args) => written.push(args));
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'be-there-test-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const { w, mary, sarahId, tomId, tagOf } = await photoWorld(t, { store: createStore(path.join(dir, 'db.json')) });
+  assert.equal((await w.put(sarahId, mary.organizerToken)).status, 200);
+  assert.equal((await w.put(tomId, mary.organizerToken, GREY)).status, 200);
+  // The folder is lost (a disk put back from an older copy, say); the data file still names both.
+  fs.rmSync(path.join(dir, 'photos'), { recursive: true });
+  assert.equal(tagOf(mary), KEPT.etag);
+  for (const [pathname, token] of [[homePhoto(sarahId), mary.homeToken], [organizePhoto(sarahId), mary.organizerToken]]) {
+    const res = await w.bytes(pathname, { token });
+    assert.deepEqual([res.status, res.body], [404, { error: 'No photo.' }]);
+    assert.match(res.headers.get('content-type'), /^application\/json/);
+    assert.notEqual(res.headers.get('etag'), `"${KEPT.etag}"`, 'the photo’s tag is not sent for a picture that is not there');
+  }
+  // A new photo takes its place, and one that is gone can still be removed.
+  assert.deepEqual((await w.put(sarahId, mary.organizerToken, GREY)).body, { photo: KEPT_GREY.etag });
+  assert.ok((await w.bytes(homePhoto(sarahId), { token: mary.homeToken })).bytes.equals(KEPT_GREY.bytes));
+  assert.equal((await w.bytes(organizePhoto(tomId), { method: 'DELETE', token: mary.organizerToken })).status, 200);
+  assert.equal(tagOf(mary, 1), null);
+  // And removing a visitor or the home does not trip over what is missing.
+  fs.rmSync(path.join(dir, 'photos'), { recursive: true });
+  assert.equal((await w.req(`/api/organize/visitors/${sarahId}`, { token: mary.organizerToken, method: 'DELETE' })).status, 200);
+  assert.equal((await w.req('/api/organize/home', { token: mary.organizerToken, method: 'DELETE' })).status, 200);
+  assert.deepEqual(written, []);
+});
+
 test('photos: with a store kept in memory, as these tests use, the pictures are in memory too', async (t) => {
   const photos = photosInMemory();
   const { w, mary, sarahId, tomId } = await photoWorld(t, { store: createStore(':memory:', { photos }) });
@@ -1485,6 +1514,66 @@ test('photos: with a store kept in memory, as these tests use, the pictures are 
   assert.equal(photos.size, 1);
   assert.equal((await w.req('/api/organize/home', { token: mary.organizerToken, method: 'DELETE' })).status, 200);
   assert.equal(photos.size, 0);
+});
+
+// A photo that arrives slowly. `started` is kept once the server has let the
+// organizer in and is waiting for the picture itself; finish() then sends it.
+function slowUpload(server, pathname, token, body) {
+  const request = http.request(server.url + pathname, { method: 'PUT', headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'image/jpeg', 'Content-Length': body.length, Expect: '100-continue' } });
+  const started = new Promise((resolve) => { request.once('continue', resolve); });
+  const answered = new Promise((resolve, reject) => {
+    request.once('error', reject);
+    request.once('response', (res) => {
+      const chunks = [];
+      res.on('data', (chunk) => chunks.push(chunk));
+      res.on('end', () => resolve({ status: res.statusCode, body: JSON.parse(Buffer.concat(chunks).toString('utf8')) }));
+    });
+  });
+  request.flushHeaders();
+  return { started, finish: () => { request.end(body); return answered; } };
+}
+
+test('photos: nothing is kept for a visitor removed, or a home deleted, while the picture was on its way', async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'be-there-test-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const photosDir = path.join(dir, 'photos');
+  const files = () => (fs.existsSync(photosDir) ? fs.readdirSync(photosDir, { recursive: true, withFileTypes: true }).filter((e) => e.isFile()).map((e) => path.relative(photosDir, path.join(e.parentPath, e.name))).sort() : []);
+  const { w, mary, joe, sarahId, tomId, annId, tagOf } = await photoWorld(t, { store: createStore(path.join(dir, 'db.json')) });
+  const states = () => mary.homeScreen.seen.filter((m) => m.type === 'state').length;
+
+  // Sent slowly and left alone, a photo is kept as usual.
+  const usual = slowUpload(w.server, organizePhoto(sarahId), mary.organizerToken, CANVAS);
+  await usual.started;
+  assert.deepEqual(files(), [], 'nothing is kept before the picture has arrived');
+  assert.deepEqual(await usual.finish(), { status: 200, body: { photo: KEPT.etag } });
+  assert.deepEqual(files(), [path.join(mary.home.id, `${sarahId}.jpg`)]);
+
+  // Tom is removed while his photo is arriving: it is not kept, and the answer says so.
+  const forTom = slowUpload(w.server, organizePhoto(tomId), mary.organizerToken, GREY);
+  await forTom.started;
+  assert.equal((await w.req(`/api/organize/visitors/${tomId}`, { token: mary.organizerToken, method: 'DELETE' })).status, 200);
+  await mary.homeScreen.next('state', (m) => m.home.visitors.length === 1);
+  const told = states();
+  assert.deepEqual(await forTom.finish(), { status: 404, body: { error: 'No such visitor.' } });
+  assert.deepEqual(files(), [path.join(mary.home.id, `${sarahId}.jpg`)]);
+  assert.equal(w.store.photoBytes(mary.home, tomId), null);
+  assert.equal(states(), told, 'and the home screen is told nothing');
+
+  // The whole home is deleted while a new photo of Sarah is arriving: no
+  // picture may be left behind in a folder nothing would ever clear away.
+  const forSarah = slowUpload(w.server, organizePhoto(sarahId), mary.organizerToken, GREY);
+  await forSarah.started;
+  assert.equal((await w.req('/api/organize/home', { token: mary.organizerToken, method: 'DELETE' })).status, 200);
+  assert.deepEqual(files(), []);
+  assert.deepEqual(await forSarah.finish(), { status: 404, body: { error: 'No such visitor.' } });
+  assert.deepEqual(files(), [], 'nothing was written for the home that is gone');
+  assert.equal(fs.existsSync(path.join(photosDir, mary.home.id)), false);
+  assert.equal(w.store.getHome(mary.home.id), null);
+
+  // The home next door is as it was, and can still be given a photo.
+  assert.equal(tagOf(joe), null);
+  assert.equal((await w.put(annId, joe.organizerToken)).status, 200);
+  assert.deepEqual(files(), [path.join(joe.home.id, `${annId}.jpg`)]);
 });
 
 test('photos: at most 10 uploads a minute from one address', async (t) => {

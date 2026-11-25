@@ -185,6 +185,12 @@ legend { font-weight: 600; padding: 0 6px; }
 /* The visitor's photo before their name, on the home screen, when there is one. */
 .with-you .avatar { width: 44px; height: 44px; background: none; }
 .with-you .avatar:empty { display: none; }
+/* On the home screen the label is never wider than the screen. A very long
+   name goes onto a second line, so the red light, the photo and the whole
+   name always show (the photo takes room the name used to have). */
+.home-screen .with-you { width: max-content; max-width: calc(100% - 24px); white-space: normal; }
+.home-screen .with-you > * { flex: none; }
+.home-screen .with-you #with-you-text { flex: 0 1 auto; min-width: 0; overflow-wrap: anywhere; }
 .live-dot { width: 18px; height: 18px; border-radius: 50%; background: #ff3b30; box-shadow: 0 0 0 4px rgba(255, 59, 48, 0.35); animation: pulse 1.6s ease-in-out infinite; }
 @keyframes pulse { 50% { box-shadow: 0 0 0 10px rgba(255, 59, 48, 0); } }
 @media (prefers-reduced-motion: reduce) { .live-dot { animation: none; } }
