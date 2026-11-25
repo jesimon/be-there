@@ -556,6 +556,31 @@ test('the organizer sees whether the relay is set up, and can test it', async (t
   assert.equal(w.server.relayReady, true);
 });
 
+test('the relay test falls back to the usual lifetime if a one-minute one is refused', async (t) => {
+  const w = await world(t);
+  const { organizerToken } = await w.household();
+  const test = async () => (await w.req('/api/organize/relay-test', { token: organizerToken, method: 'POST' })).body;
+  // A relay service that will not make credentials lasting only a minute.
+  const usual = w.relay.mint;
+  w.relay.mint = async (options) => {
+    if (options?.ttl !== 60) return usual(options);
+    w.relay.asked.push(options);
+    return { ok: false, reason: 'http_400' };
+  };
+  assert.deepEqual(await test(), { ok: true });
+  assert.deepEqual(w.relay.asked, [{ ttl: 60 }, undefined]);
+  assert.deepEqual(w.relay.revoked, ['relay-user-1'], 'and those are revoked straight away as well');
+
+  // Refused either way: the reason is passed on, after one more try and no more.
+  w.relay.mint = async (options) => { w.relay.asked.push(options); return { ok: false, reason: 'http_400' }; };
+  assert.deepEqual(await test(), { ok: false, reason: 'http_400' });
+  assert.equal(w.relay.asked.length, 4);
+  // A key that is not accepted is not tried twice.
+  w.relay.mint = async (options) => { w.relay.asked.push(options); return { ok: false, reason: 'http_401' }; };
+  assert.deepEqual(await test(), { ok: false, reason: 'http_401' });
+  assert.equal(w.relay.asked.length, 5);
+});
+
 test('why a visit ended is passed on only when it is a reason we know', async (t) => {
   const w = await world(t);
   const v = await w.visit();
@@ -591,6 +616,20 @@ test('why a visit ended is passed on only when it is a reason we know', async (t
   await v.homeScreen.next('knock');
   v.sarah.send({ type: 'cancel', reason: 'no_connection' });
   assert.equal((await v.homeScreen.next('ended')).reason, 'cancelled');
+  assert.equal((await v.sarah.next('ended')).reason, 'cancelled');
+
+  // A knock that was never answered has not tried to connect: neither side
+  // can make the other be told that it "couldn't connect".
+  v.sarah.send({ type: 'knock' });
+  await v.homeScreen.next('knock');
+  v.sarah.send({ type: 'end', reason: 'no_connection' });
+  assert.equal((await v.homeScreen.next('ended')).reason, 'ended');
+  assert.equal((await v.sarah.next('ended')).reason, 'ended');
+  v.sarah.send({ type: 'knock' });
+  await v.homeScreen.next('knock');
+  v.homeScreen.send({ type: 'end', reason: 'no_connection' });
+  assert.equal((await v.sarah.next('ended')).reason, 'ended');
+  assert.equal((await v.homeScreen.next('ended')).reason, 'ended');
 });
 
 test('a visit through the relay leaves nothing in the server’s log', async (t) => {

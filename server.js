@@ -21,8 +21,13 @@ const RING_SECONDS = 45;
 // it is first needed, then again only if a very long visit outlasts them.
 const MAX_RELAY_MINTS = 4;
 // Why a device may say a visit ended. Anything else is passed on as 'ended'.
+// "Could not connect" is only believed of a visit that was answered: a knock
+// that is still ringing has not tried to connect yet.
 const END_REASONS = ['ended', 'no_connection'];
-const endReason = (reason) => (END_REASONS.includes(reason) ? reason : 'ended');
+function endReason(reason, call) {
+  if (!END_REASONS.includes(reason)) return 'ended';
+  return reason === 'no_connection' && call?.state !== 'live' ? 'ended' : reason;
+}
 
 const bearer = (req) => (/^Bearer\s+(\S+)$/i.exec(req.get('authorization') || '') || [])[1] || '';
 
@@ -101,7 +106,12 @@ export function createApp({
   // that last a minute, and make them stop working straight away.
   app.post('/api/organize/relay-test', organizer, rateLimit(6), async (req, res) => {
     if (!relay.ready) return res.json({ ok: false, reason: 'not_set_up' });
-    const made = await Promise.resolve().then(() => relay.mint({ ttl: 60 })).catch(() => null);
+    const attempt = (options) => Promise.resolve().then(() => relay.mint(options)).catch(() => null);
+    let made = await attempt({ ttl: 60 });
+    // 400 is the relay service refusing the request itself, not the key. In
+    // case it is the one-minute life it will not have, try once with the usual
+    // one, so that a good key is never reported as a bad one.
+    if (made?.reason === 'http_400') made = await attempt();
     if (!made?.ok) return res.json({ ok: false, reason: made?.reason || 'network' });
     await revoke(made.username);
     res.json({ ok: true });
@@ -319,7 +329,7 @@ export function createApp({
       case 'decline':
         return endCallIf(home.id, (c) => c.visitorId === msg.visitorId && c.state === 'ringing', 'declined');
       case 'end':
-        return endCallIf(home.id, () => true, endReason(msg.reason));
+        return endCallIf(home.id, () => true, endReason(msg.reason, l.call));
       case 'signal':
         if (l.call?.state === 'live') send(l.call.socket, { type: 'signal', data: msg.data });
         return;
@@ -348,7 +358,7 @@ export function createApp({
       }
       case 'cancel':
       case 'end':
-        endCallIf(home.id, (c) => c.socket === ws, msg.type === 'cancel' ? 'cancelled' : endReason(msg.reason));
+        endCallIf(home.id, (c) => c.socket === ws, msg.type === 'cancel' ? 'cancelled' : endReason(msg.reason, l.call));
         return;
       case 'signal':
         if (l.call?.socket === ws && l.call.state === 'live') send(l.homeSocket, { type: 'signal', data: msg.data });

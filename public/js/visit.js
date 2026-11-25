@@ -100,6 +100,9 @@ function startCall() {
       if (peer !== mine) return;
       // The video never connected, or was lost for good: the visit is over.
       if (state === 'no_connection') return endLocal('no_connection');
+      // After a drop the way through may have changed: say nothing about it
+      // until it has been read again.
+      if (state === 'reconnecting') path = null;
       linkState = state;
       renderPath();
     },

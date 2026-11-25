@@ -116,16 +116,24 @@ function hideKnock() {
 async function answer() {
   if (!call || call.state !== 'ringing') return;
   hideKnock();
+  const answering = call;
   const { visitorId, name } = call;
   call.state = 'connecting';
+  let camera;
   try {
-    stream = await getCamera();
+    camera = await getCamera();
   } catch {
+    // The knock ended while the camera was being asked for: nothing to refuse.
+    if (call !== answering) return;
     link.send({ type: 'decline', visitorId });
     call = null;
     alert('The camera or microphone could not be used. Please ask your family to check the tablet’s settings.');
     return;
   }
+  // The visitor gave up while the camera was starting. There is no visit to
+  // show, and the camera must not stay on.
+  if (call !== answering) return stopStream(camera);
+  stream = camera;
   $('#local').srcObject = stream;
   $('#with-you-text').textContent = `${name} is with you`;
   $('#call').hidden = false;

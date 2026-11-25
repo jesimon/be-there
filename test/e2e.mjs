@@ -68,7 +68,11 @@ const relay = {
   async revoke(username) { turn.removeUser(username); relay.revoked.push(username); },
 };
 
-const srv = await startServer({ port: 0, store: createStore(':memory:'), setupPassword: '', env: {}, relay });
+// The pages are told to ask the relay server on this machine for their own
+// address too (it answers STUN as well), in place of Cloudflare's public STUN
+// server, so that no browser here asks anyone outside for anything.
+const env = { ICE_SERVERS: JSON.stringify([{ urls: `stun:127.0.0.1:${turnPort}` }]) };
+const srv = await startServer({ port: 0, store: createStore(':memory:'), setupPassword: '', env, relay });
 const browser = await chromium.launch({ args: ['--use-fake-device-for-media-stream', '--use-fake-ui-for-media-stream', '--autoplay-policy=no-user-gesture-required'] });
 const step = (s) => console.log(`- ${s}`);
 const until = async (check, what, ms = 10_000) => {
@@ -87,6 +91,19 @@ const watchPeers = () => {
   window.peersMade = [];
   window.RTCPeerConnection = class extends Real {
     constructor(...args) { super(...args); window.peersMade.push(this); }
+  };
+};
+// Lets the test make this page's camera slow to start, as a tablet's can be,
+// and keeps hold of what the camera gave, to check it was switched off again.
+const slowCamera = () => {
+  const real = navigator.mediaDevices.getUserMedia.bind(navigator.mediaDevices);
+  window.cameraDelay = 0;
+  window.camerasOpened = [];
+  navigator.mediaDevices.getUserMedia = async (constraints) => {
+    await new Promise((resolve) => setTimeout(resolve, window.cameraDelay));
+    const stream = await real(constraints);
+    window.camerasOpened.push(stream);
+    return stream;
   };
 };
 // Stands in for a network that lets nothing through directly (mobile data, an
@@ -141,6 +158,7 @@ try {
   // The home screen (a tablet in landscape).
   const homeCtx = await browser.newContext({ viewport: { width: 1180, height: 820 }, permissions: ['camera', 'microphone'] });
   await homeCtx.addInitScript(watchPeers);
+  await homeCtx.addInitScript(slowCamera);
   const home = await homeCtx.newPage();
   await home.goto(homeLink);
   // The screen connects without a tap: the organizer sees it is on.
@@ -190,6 +208,8 @@ try {
   // Sarah's page says, in one small line, that the visit went directly. The
   // home screen says nothing about how it is connected.
   await pathLine(visit, 'Connected directly.');
+  const stunUsed = await visit.evaluate(() => window.peersMade.at(-1).getConfiguration().iceServers.flatMap((s) => s.urls));
+  assert.deepEqual(stunUsed, [`stun:127.0.0.1:${turnPort}`], 'a direct visit is given public STUN only, here the one on this machine');
   assert.notEqual((await chosenPath(visit)).local, 'relay');
   assert.notEqual((await chosenPath(home)).local, 'relay');
   assert.doesNotMatch(await home.innerText('body'), /relay|directly|connect/i);
@@ -205,6 +225,26 @@ try {
   // The camera is released on the home screen when the visit ends.
   assert.equal(await home.evaluate(() => document.querySelector('#local').srcObject), null);
   step('Mary ended the visit');
+
+  // Sarah knocks again and gives up just as Mary answers, while the tablet's
+  // camera is still starting. No visit is left on the home screen (it would
+  // show Sarah as being there, and later end someone else's knock), and the
+  // camera does not stay on.
+  const linksBefore = await home.evaluate(() => window.peersMade.length);
+  const camerasBefore = await home.evaluate(() => window.camerasOpened.length);
+  await home.evaluate(() => { window.cameraDelay = 1500; });
+  await visit.click('#visit');
+  await home.waitForSelector('#knock:not([hidden])');
+  await home.click('#answer');
+  await visit.click('#cancel');
+  await home.waitForFunction((n) => window.camerasOpened.length > n, camerasBefore);
+  await home.waitForTimeout(500);
+  assert.equal(await home.isVisible('#call'), false, 'no visit is shown on the home screen');
+  assert.equal(await home.isVisible('#idle'), true);
+  assert.equal(await home.evaluate(() => window.camerasOpened.at(-1).getTracks().every((t) => t.readyState === 'ended')), true, 'the camera was switched off again');
+  assert.equal(await home.evaluate(() => window.peersMade.length), linksBefore, 'no video link was made');
+  await home.evaluate(() => { window.cameraDelay = 0; });
+  step('a knock given up while the home camera was starting leaves no visit behind');
 
   // Drop-in: Mary lets Sarah come straight in; Mary still gets notice.
   await home.click('.person .btn.toggle');
