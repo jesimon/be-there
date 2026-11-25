@@ -250,9 +250,9 @@ const until = async (check, what = 'condition') => {
 
 // A server of its own with a fake relay. Homes are made straight in the store,
 // so the tests are not slowed by the limit on creating homes.
-async function world(t, { relay = fakeRelay(), now } = {}) {
+async function world(t, { relay = fakeRelay(), now, env = {} } = {}) {
   const store = createStore(':memory:');
-  const server = await startServer({ port: 0, store, setupPassword: '', env: {}, relay, ...(now ? { now } : {}) });
+  const server = await startServer({ port: 0, store, setupPassword: '', env, relay, ...(now ? { now } : {}) });
   let closed = false;
   const close = async () => { if (!closed) { closed = true; await server.close(); } };
   t.after(close);
@@ -888,49 +888,79 @@ test('both addresses are served alike: 200 for either Host, and never a redirect
 });
 
 test('links, visits and the live connection work the same through either address', async (t) => {
-  const w = await world(t);
-  const { home, homeToken, organizerToken } = w.store.createHome({ personName: 'Mary', hours: { start: '00:00', end: '00:00' } });
-  const { visitor, token } = w.store.addVisitor(home, { name: 'Sarah' });
-  w.store.updateVisitor(home, visitor.id, { approved: true });
   const OLD = 'be-there-gp50.onrender.com';
   const NEW = 'bethere.gladspring.org';
-  for (const Host of [OLD, NEW]) {
-    const organize = await raw(w.server, '/api/organize', { Host, Authorization: `Bearer ${organizerToken}` });
-    assert.equal(organize.status, 200, Host);
-    assert.equal(JSON.parse(organize.text).home.personName, 'Mary');
-    assert.equal((await raw(w.server, '/api/visit', { Host, Authorization: `Bearer ${token}` })).status, 200, Host);
-  }
+  // With the new address switched on, as it is once deployed, and with it off.
+  // Switched on, it is still only something pages are told: the server turns
+  // nobody away at /ws for the name they came by, or for the page they came from.
+  for (const env of [{ CANONICAL_ORIGIN: NEW_ADDRESS }, {}]) {
+    const mode = env.CANONICAL_ORIGIN ? 'new address on' : 'new address off';
+    const w = await world(t, { env });
+    assert.equal(w.server.canonicalOrigin, env.CANONICAL_ORIGIN || null);
+    const { home, homeToken, organizerToken } = w.store.createHome({ personName: 'Mary', hours: { start: '00:00', end: '00:00' } });
+    const { visitor, token } = w.store.addVisitor(home, { name: 'Sarah' });
+    w.store.updateVisitor(home, visitor.id, { approved: true });
+    for (const Host of [OLD, NEW]) {
+      const organize = await raw(w.server, '/api/organize', { Host, Authorization: `Bearer ${organizerToken}` });
+      assert.equal(organize.status, 200, `${Host}, ${mode}`);
+      assert.equal(JSON.parse(organize.text).home.personName, 'Mary');
+      assert.equal((await raw(w.server, '/api/visit', { Host, Authorization: `Bearer ${token}` })).status, 200, `${Host}, ${mode}`);
+    }
 
-  // A live connection to /ws by either name, as a browser at either address
-  // makes it. The home screen stays at the old address; the visitor is at the
-  // new one. They still meet: it is one server.
-  const join = (Host, role, secret) => {
-    const ws = new WebSocket(w.server.url.replace('http', 'ws') + '/ws', { headers: { Host }, origin: `https://${Host}` });
-    const seen = [];
-    ws.on('message', (data) => seen.push(JSON.parse(data.toString())));
-    ws.on('open', () => ws.send(JSON.stringify({ type: 'hello', role, token: secret, timeZone: 'UTC' })));
-    t.after(() => ws.terminate());
-    const got = (type) => until(() => seen.some((m) => m.type === type), `${type} at ${Host}`).then(() => seen.find((m) => m.type === type));
-    return { ws, seen, got, send: (m) => ws.send(JSON.stringify(m)) };
-  };
-  const homeScreen = join(OLD, 'home', homeToken);
-  await homeScreen.got('state');
-  const sarah = join(NEW, 'visitor', token);
-  await until(() => sarah.seen.some((m) => m.type === 'status' && m.view.canVisit), 'Sarah to be able to visit');
-  sarah.send({ type: 'knock' });
-  assert.equal((await homeScreen.got('knock')).name, 'Sarah');
-  homeScreen.send({ type: 'answer', visitorId: visitor.id });
-  await sarah.got('answered');
-  sarah.send({ type: 'signal', data: { hello: 1 } });
-  assert.deepEqual((await homeScreen.got('signal')).data, { hello: 1 });
-  homeScreen.send({ type: 'end' });
-  assert.equal((await sarah.got('ended')).reason, 'ended');
+    // A live connection to /ws by either name, as a browser at either address
+    // makes it.
+    const join = (Host, role, secret, from = Host) => {
+      const ws = new WebSocket(w.server.url.replace('http', 'ws') + '/ws', { headers: { Host }, origin: `https://${from}` });
+      const seen = [];
+      let closedWith = null;
+      ws.on('message', (data) => seen.push(JSON.parse(data.toString())));
+      ws.on('open', () => ws.send(JSON.stringify({ type: 'hello', role, token: secret, timeZone: 'UTC' })));
+      ws.on('close', (code) => { closedWith = code; });
+      ws.on('error', () => { closedWith ??= 'refused'; });
+      t.after(() => ws.terminate());
+      const got = (type) => until(() => seen.some((m) => m.type === type) || closedWith !== null, `${type} at ${Host}, ${mode}`).then(() => {
+        assert.equal(closedWith, null, `${role} at ${Host} was turned away, ${mode}`);
+        return seen.find((m) => m.type === type);
+      });
+      return { ws, seen, got, send: (m) => ws.send(JSON.stringify(m)) };
+    };
+    // Each kind of page is let in at each address, whichever of the two the
+    // page itself was loaded from...
+    for (const Host of [OLD, NEW]) {
+      for (const from of [OLD, NEW]) {
+        const asVisitor = join(Host, 'visitor', token, from);
+        await asVisitor.got('status');
+        asVisitor.ws.terminate();
+      }
+    }
+    // ...the home screen too, whichever of the two it is at.
+    const first = join(NEW, 'home', homeToken);
+    await first.got('state');
+    first.ws.terminate();
+    await until(() => first.ws.readyState === WebSocket.CLOSED, 'the first home screen to go');
+
+    // The home screen stays at the old address; the visitor is at the new
+    // one. They still meet: it is one server.
+    const homeScreen = join(OLD, 'home', homeToken);
+    await homeScreen.got('state');
+    const sarah = join(NEW, 'visitor', token);
+    await until(() => sarah.seen.some((m) => m.type === 'status' && m.view.canVisit), `Sarah to be able to visit, ${mode}`);
+    sarah.send({ type: 'knock' });
+    assert.equal((await homeScreen.got('knock')).name, 'Sarah');
+    homeScreen.send({ type: 'answer', visitorId: visitor.id });
+    await sarah.got('answered');
+    sarah.send({ type: 'signal', data: { hello: 1 } });
+    assert.deepEqual((await homeScreen.got('signal')).data, { hello: 1 });
+    homeScreen.send({ type: 'end' });
+    assert.equal((await sarah.got('ended')).reason, 'ended');
+    await w.close();
+  }
 });
 
 test('a page checking the new address opens /ws and says nothing: nothing happens, nothing is logged', async (t) => {
   const written = [];
   for (const method of ['log', 'info', 'warn', 'error', 'debug']) t.mock.method(console, method, (...args) => written.push(args));
-  const w = await world(t);
+  const w = await world(t, { env: { CANONICAL_ORIGIN: NEW_ADDRESS } });
   const h = await w.household();
   // The check a page at the old address makes before it moves: from another
   // address, open, wait, close. No hello, no link.
