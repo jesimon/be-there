@@ -168,3 +168,5 @@ legend { font-weight: 600; padding: 0 6px; }
 .preview { width: 100%; max-width: 360px; border-radius: var(--radius); background: #000; transform: scaleX(-1); display: block; margin: 16px auto; }
 .visit-screen .page { text-align: center; }
 .knock .big { font-size: clamp(1.4rem, 3vw, 2rem); }
+
+.link-actions { display: flex; flex-wrap: wrap; gap: 10px; }

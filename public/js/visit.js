@@ -1,8 +1,8 @@
 // The visitor's page: see whether you can visit, then knock (or come straight
 // in, if the person at home allows it).
-import { $, tokenFromLink, connect, getCamera, stopStream, makePeer } from './common.js';
+import { $, rememberedToken, forgetToken, connect, getCamera, stopStream, makePeer } from './common.js';
 
-const token = tokenFromLink();
+const token = rememberedToken('visit');
 let link;
 let view = null;
 let phase = 'idle';      // idle | ringing | live
@@ -119,7 +119,9 @@ function onMessage(msg) {
 
 if (!token) {
   $('#title').textContent = 'This link is missing its key';
-  $('#state').textContent = 'Ask the family for your Be There link.';
+  $('#state').textContent = 'Open your Be There link again, in full.';
+  $('#hint').textContent = 'The long code after the # was lost. If you set things up, use “Open it on this phone” on the organizer page.';
+  $('#visit').hidden = true;
 } else {
   link = connect({
     role: 'visitor',
@@ -127,6 +129,7 @@ if (!token) {
     onMessage,
     onState: (s) => { if (s === 'closed' && phase !== 'idle') endLocal('offline'); },
     onRejected: () => {
+      forgetToken('visit');
       endLocal();
       $('#title').textContent = 'This link no longer works';
       $('#state').textContent = 'Ask the family for a new one.';

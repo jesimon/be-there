@@ -6,6 +6,26 @@ export function tokenFromLink() {
   return decodeURIComponent(location.hash.replace(/^#/, '').trim());
 }
 
+// The link's secret, remembered on this device so a bookmark or a link that
+// lost its # part still works here. Forgotten when the server refuses it.
+export function rememberedToken(kind) {
+  const key = `bethere.${kind}`;
+  const fromLink = tokenFromLink();
+  try {
+    if (fromLink) localStorage.setItem(key, fromLink);
+    else {
+      const saved = localStorage.getItem(key) || '';
+      // Put it back in the address bar so a bookmark made now includes it.
+      if (saved) history.replaceState(null, '', `${location.pathname}#${saved}`);
+      return saved;
+    }
+  } catch { /* storage unavailable: use the link only */ }
+  return fromLink;
+}
+export function forgetToken(kind) {
+  try { localStorage.removeItem(`bethere.${kind}`); } catch { /* ignore */ }
+}
+
 export const $ = (sel, root = document) => root.querySelector(sel);
 
 export function el(tag, attrs = {}, ...children) {
@@ -48,7 +68,9 @@ export function connect({ role, token, onMessage, onState, onRejected }) {
   let ws;
   let stopped = false;
   let delay = 1000;
+  let retry = null;
   const open = () => {
+    clearTimeout(retry);
     ws = new WebSocket(`${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws`);
     ws.onopen = () => {
       delay = 1000;
@@ -62,11 +84,17 @@ export function connect({ role, token, onMessage, onState, onRejected }) {
       onState?.('closed');
       if (stopped) return;
       if (e.code >= 4001 && e.code <= 4004) { stopped = true; onRejected?.(e.code, e.reason); return; }
-      setTimeout(open, delay);
+      retry = setTimeout(open, delay);
       delay = Math.min(delay * 2, 15_000);
     };
   };
   open();
+  // A tablet that slept may hold a dead connection: when it wakes, reconnect
+  // at once instead of waiting for the next retry.
+  document.addEventListener('visibilitychange', () => {
+    if (stopped || document.visibilityState !== 'visible') return;
+    if (!ws || ws.readyState === WebSocket.CLOSED || ws.readyState === WebSocket.CLOSING) { delay = 1000; open(); }
+  });
   return {
     send: (msg) => { if (ws?.readyState === 1) ws.send(JSON.stringify(msg)); },
     close: () => { stopped = true; ws?.close(); },

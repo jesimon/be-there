@@ -41,6 +41,7 @@ try {
   await org.click('#invite button[type=submit]');
   await org.waitForSelector('#new-link:not([hidden])');
   const visitLink = await org.textContent('#new-url');
+  assert.equal(await org.getAttribute('#new-open', 'href'), visitLink, '“Open it on this phone” opens the full link');
   await snap(org, '2-organizer');
   step('invited Sarah');
 
@@ -116,6 +117,18 @@ try {
   await visit.waitForFunction(() => document.querySelector('#state').textContent.includes('paused'));
   assert.equal(await visit.isDisabled('#visit'), true);
   step('pausing stops visits');
+
+  // The visitor page remembers its link: opening /visit without the # part
+  // on the same phone still works, and puts the link back in the address bar.
+  await visit.goto(`${srv.url}/visit`);
+  await visit.waitForFunction(() => document.querySelector('#title')?.textContent.includes('Visit Mary'));
+  assert.equal(new URL(visit.url()).hash, new URL(visitLink).hash);
+  // A different phone without the link is told the code is missing, with no button.
+  const stranger = await (await browser.newContext()).newPage();
+  await stranger.goto(`${srv.url}/visit`);
+  await stranger.waitForFunction(() => document.querySelector('#title')?.textContent.includes('missing its key'));
+  assert.equal(await stranger.isVisible('#visit'), false);
+  step('visitor link is remembered on the phone; a bare link shows no button');
 
   console.log('E2E passed');
 } finally {

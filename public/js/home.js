@@ -2,9 +2,9 @@
 // Large, calm, and theirs to control: who may visit, whether anyone may come
 // straight in, pausing visits, and ending any visit with one tap. A red light
 // and their visitor's name show for the whole of every visit.
-import { $, el, initials, tokenFromLink, connect, getCamera, stopStream, makePeer, unlockSound, chime } from './common.js';
+import { $, el, initials, rememberedToken, forgetToken, connect, getCamera, stopStream, makePeer, unlockSound, chime } from './common.js';
 
-const token = tokenFromLink();
+const token = rememberedToken('home');
 let link;
 let home = null;
 let call = null;          // { visitorId, name, state }
@@ -182,6 +182,7 @@ function start() {
       if (s === 'closed') { $('#status').textContent = 'Reconnecting…'; $('#status').className = 'status-pill'; endLocal(); }
     },
     onRejected: (code) => {
+      if (code !== 4004) forgetToken('home');
       endLocal();
       if (code === 4004) showProblem('Open on another screen', 'Be There was opened on another screen. Reload this page to use it here instead.');
       else showProblem('This link no longer works', 'Ask your family for the new home screen link.');

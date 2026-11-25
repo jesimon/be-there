@@ -6,6 +6,14 @@ let home = null;
 
 const call = (path, opts = {}) => api(path, { token, ...opts });
 
+// The phone's own share sheet (Messages, Mail, AirDrop), where available:
+// it sends the whole link, so the secret after the # is never lost.
+function offerShare(button, url, title) {
+  if (!navigator.share) return;
+  button.hidden = false;
+  button.onclick = () => navigator.share({ title, url }).catch(() => {});
+}
+
 function render(online) {
   $('#title').textContent = home.name;
   for (const n of document.querySelectorAll('.person-name-inline')) n.textContent = home.personName;
@@ -47,7 +55,10 @@ $('#invite').addEventListener('submit', async (e) => {
   try {
     const res = await call('/api/organize/visitors', { method: 'POST', body: { name: f.get('name'), relation: f.get('relation') } });
     $('#new-name').textContent = res.visitor.name;
-    $('#new-url').textContent = `${location.origin}/visit#${res.token}`;
+    const url = `${location.origin}/visit#${res.token}`;
+    $('#new-url').textContent = url;
+    $('#new-open').href = url;
+    offerShare($('#new-share'), url, `Your Be There link to visit ${home.personName}`);
     $('#new-link').hidden = false;
     e.target.reset();
     load();
@@ -66,7 +77,9 @@ $('#hours').addEventListener('submit', async (e) => {
 $('#new-home-link').addEventListener('click', async () => {
   if (!confirm('Make a new home screen link? The current home screen will stop working until you open the new link on it.')) return;
   const res = await call('/api/organize/home-link', { method: 'POST' });
-  $('#home-url').textContent = `${location.origin}/home#${res.homeToken}`;
+  const homeUrl = `${location.origin}/home#${res.homeToken}`;
+  $('#home-url').textContent = homeUrl;
+  offerShare($('#home-share'), homeUrl, `Be There home screen for ${home.personName}`);
   $('#home-link-box').hidden = false;
 });
 
