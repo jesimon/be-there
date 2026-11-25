@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="robots" content="noindex, nofollow">
+  <title>Set up a home · Be There</title>
+  <link rel="stylesheet" href="/css/style.css">
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+  <main class="page narrow">
+    <p class="brand"><a href="/">Be There</a></p>
+    <h1>Set up a home</h1>
+    <p class="muted">For the family member who looks after the screen. It takes a minute.</p>
+
+    <form id="form" class="form">
+      <label>Who will be visited? <input name="personName" required maxlength="60" placeholder="Their first name, e.g. Mary"></label>
+      <label>Name for their home <input name="name" maxlength="60" placeholder="e.g. Mum’s home (optional)"></label>
+      <fieldset>
+        <legend>Visiting hours, in their time</legend>
+        <div class="row">
+          <label>From <input name="start" type="time" value="08:00" required></label>
+          <label>Until <input name="end" type="time" value="21:00" required></label>
+        </div>
+      </fieldset>
+      <label id="pw-label" hidden>Setup password <input name="password" type="password" autocomplete="current-password"></label>
+      <p id="error" class="error" role="alert"></p>
+      <button class="btn yes" type="submit">Create the home</button>
+    </form>
+
+    <section id="done" hidden>
+      <h2>Done. Keep these two links safe.</h2>
+      <p>Each is shown only once. Anyone with a link can use it, so share them only with the right people.</p>
+      <div class="link-box">
+        <h3>1. The home screen</h3>
+        <p>Open this on the tablet that will stay in their home.</p>
+        <code id="home-link"></code>
+        <button class="btn" type="button" data-copy="home-link">Copy</button>
+      </div>
+      <div class="link-box">
+        <h3>2. Your organizer page</h3>
+        <p>Use this to invite family and friends. Bookmark it.</p>
+        <code id="org-link"></code>
+        <button class="btn" type="button" data-copy="org-link">Copy</button>
+        <a id="org-open" class="btn yes" href="#">Open the organizer page</a>
+      </div>
+    </section>
+  </main>
+  <script type="module" src="/js/setup.js"></script>
+</body>
+</html>

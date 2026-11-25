@@ -1,0 +1,26 @@
+# Render Blueprint for Be There: one web service with a small persistent disk
+# for its data file. Pushing to main deploys automatically.
+services:
+  - type: web
+    name: be-there
+    runtime: node
+    plan: starter
+    buildCommand: npm ci
+    startCommand: npm start
+    healthCheckPath: /healthz
+    autoDeploy: true
+    disk:
+      name: be-there-data
+      mountPath: /var/data
+      sizeGB: 1
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: NODE_VERSION
+        value: "22"
+      - key: DATA_FILE
+        value: /var/data/db.json
+      # Needed to create a home. Render makes a random one; read it on the
+      # service's Environment page.
+      - key: SETUP_PASSWORD
+        generateValue: true
