@@ -6,6 +6,9 @@
 // machine (node-turn) standing in for Cloudflare's: nothing here leaves the
 // machine. Then the new address: one server reached by two names, as the real
 // one is, and pages that move from the old name to the new one (or stay).
+// Along the way, visitors' photos: the organizer adds, changes and removes
+// one, the home screen shows it on the list, at the door and during the
+// visit, and every request the home screen makes for a photo is counted.
 // It takes about a minute and a half, a third of it waiting for a visit that
 // is meant not to connect.
 import assert from 'node:assert/strict';
@@ -15,9 +18,12 @@ import fs from 'node:fs';
 import http from 'node:http';
 import net from 'node:net';
 import path from 'node:path';
+import zlib from 'node:zlib';
 import { createRequire } from 'node:module';
+import { fileURLToPath } from 'node:url';
 import { startServer } from '../server.js';
 import { createStore } from '../lib/store.js';
+import { inspectJpeg } from '../lib/jpeg.js';
 
 // Playwright is loaded with require so a globally installed copy works too.
 const require = createRequire(import.meta.url);
@@ -134,6 +140,69 @@ const chosenPath = (page) => page.evaluate(async () => {
 });
 const pathLine = (page, text) => page.waitForFunction((t) => document.querySelector('#path')?.textContent === t, text, { timeout: 20_000 });
 
+// ----- Photos -----
+// A picture for the organizer to pick, made here (nothing a camera took): a
+// PNG wider than it is tall. Its middle square is teal on the left and orange
+// on the right, with a face-coloured disc; the strips to the left and right
+// of the square are magenta, and must be cut away. (The second photo, below,
+// is taller than wide: between them both ways of cutting are tried.)
+const crcTable = Array.from({ length: 256 }, (_, n) => { let c = n; for (let k = 0; k < 8; k += 1) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1; return c >>> 0; });
+const crc32 = (buf) => { let c = 0xffffffff; for (const byte of buf) c = crcTable[(c ^ byte) & 255] ^ (c >>> 8); return (c ^ 0xffffffff) >>> 0; };
+function png(width, height, colourAt) {
+  const raw = Buffer.alloc(height * (1 + width * 3));
+  for (let y = 0; y < height; y += 1) for (let x = 0; x < width; x += 1) raw.set(colourAt(x, y), y * (1 + width * 3) + 1 + x * 3);
+  const chunk = (type, data) => {
+    const body = Buffer.concat([Buffer.from(type), data]);
+    const out = Buffer.alloc(body.length + 8);
+    out.writeUInt32BE(data.length);
+    body.copy(out, 4);
+    out.writeUInt32BE(crc32(body), body.length + 4);
+    return out;
+  };
+  const head = Buffer.alloc(13);
+  head.writeUInt32BE(width);
+  head.writeUInt32BE(height, 4);
+  head.set([8, 2, 0, 0, 0], 8);
+  return Buffer.concat([Buffer.from('89504e470d0a1a0a', 'hex'), chunk('IHDR', head), chunk('IDAT', zlib.deflateSync(raw)), chunk('IEND', Buffer.alloc(0))]);
+}
+const TEAL = [20, 140, 150];
+const ORANGE = [235, 140, 30];
+const MAGENTA = [230, 0, 230];
+const firstPhoto = png(800, 600, (x, y) => {
+  if (x < 100 || x >= 700) return MAGENTA;
+  if ((x - 400) ** 2 + (y - 300) ** 2 < 150 ** 2) return [240, 200, 170];
+  return x < 400 ? TEAL : ORANGE;
+});
+// The second photo is a file as a phone held upright makes it: stored on its
+// side, with a note beside the picture saying which way up it goes. Upright,
+// its corners are red, green, blue and yellow.
+const sidewaysPhoto = fileURLToPath(new URL('./fixtures/sideways-320x240.jpg', import.meta.url));
+const UPRIGHT = [[255, 0, 0], [0, 255, 0], [0, 0, 255], [255, 255, 0]];
+const near = (a, b) => a.every((v, i) => Math.abs(v - b[i]) <= 45);
+// The picture an avatar on the page is showing: its size, where it comes
+// from, and the colours of its four corners. Null if it shows none.
+const faceIn = (page, selector) => page.evaluate((sel) => {
+  const img = document.querySelector(`${sel} img`);
+  if (!img || !img.complete || !img.naturalWidth) return null;
+  const canvas = document.createElement('canvas');
+  canvas.width = img.naturalWidth;
+  canvas.height = img.naturalHeight;
+  const ctx = canvas.getContext('2d');
+  ctx.drawImage(img, 0, 0);
+  const at = (x, y) => Array.from(ctx.getImageData(x, y, 1, 1).data.slice(0, 3));
+  const w = canvas.width;
+  const h = canvas.height;
+  const shown = img.getBoundingClientRect();
+  return { width: w, height: h, src: img.src, alt: img.getAttribute('alt'), shown: [Math.round(shown.width), Math.round(shown.height)], corners: [at(8, 8), at(w - 9, 8), at(8, h - 9), at(w - 9, h - 9)] };
+}, selector);
+const waitForFace = async (page, selector, not = '') => {
+  await page.waitForFunction(([sel, old]) => { const img = document.querySelector(`${sel} img`); return img && img.complete && img.naturalWidth > 0 && img.src !== old; }, [selector, not]);
+  return faceIn(page, selector);
+};
+// What an avatar shows when it has no photo: the initials, and no picture.
+const initialsIn = (page, selector) => page.evaluate((sel) => { const node = document.querySelector(sel); return node.querySelector('img') ? null : node.textContent; }, selector);
+const isPhotoRequest = (request) => /^\/api\/.*\/photo$/.test(new URL(request.url()).pathname);
+
 // ----- The new address -----
 // A port nothing is listening on (it was free a moment ago).
 const freeTcpPort = () => new Promise((resolve, reject) => {
@@ -196,6 +265,10 @@ try {
   assert.equal(await org.isVisible('#moved-note'), false);
   assert.match(await org.innerText('.tips'), /Keeping the tablet ready/);
   await snap(org, '2-organizer');
+  // Sarah has no photo yet: her initial, and one button to add one.
+  assert.equal(await initialsIn(org, '#visitors li .avatar'), 'S');
+  assert.deepEqual(await org.locator('#visitors .photo-tools button').allTextContents(), ['Add a photo']);
+  await snapAll(org, '2b-organizer-row-without-photo', '#visitors');
   step('invited Sarah');
 
   // The home screen (a tablet in landscape).
@@ -203,6 +276,10 @@ try {
   await homeCtx.addInitScript(watchPeers);
   await homeCtx.addInitScript(slowCamera);
   const home = await homeCtx.newPage();
+  // Every request the home screen makes for a photo, from its first moment
+  // to the end of this run.
+  const homePhotoRequests = [];
+  home.on('request', (request) => { if (isPhotoRequest(request)) homePhotoRequests.push(`${request.method()} ${new URL(request.url()).pathname}`); });
   await home.goto(homeLink);
   // The screen connects without a tap: the organizer sees it is on.
   await org.reload();
@@ -210,12 +287,66 @@ try {
   await home.click('#start');
   await home.waitForSelector('.person.pending');
   await snap(home, '3-home-asks-mary');
+  assert.equal(await initialsIn(home, '.person.pending .avatar'), 'S', 'no photo yet: her initial');
+  assert.deepEqual(homePhotoRequests, []);
   step('home screen shows Sarah waiting for a yes');
+
+  // The organizer adds a photo of Sarah: "Add a photo", then "Choose a photo".
+  // Only a small square JPEG made on the organizer's own device is sent.
+  // (The page's own fetch is watched from inside the page: the browser does
+  // not show a test the bytes of a picture on their way out.)
+  await org.evaluate(() => {
+    const real = window.fetch;
+    window.photosSent = [];
+    window.fetch = (address, options) => {
+      if (options?.method === 'PUT') window.photosSent.push({ address: String(address), type: options.headers['Content-Type'], body: options.body });
+      return real(address, options);
+    };
+  });
+  const photosSent = async () => (await org.evaluate(() => Promise.all(window.photosSent.map(async (sent) => ({ ...sent, body: Array.from(new Uint8Array(await sent.body.arrayBuffer())) })))))
+    .map((sent) => ({ ...sent, body: Buffer.from(sent.body) }));
+  await org.click('#visitors .photo-tools button:has-text("Add a photo")');
+  assert.deepEqual(await org.locator('#visitors .photo-pick button').allTextContents(), ['Take a photo', 'Choose a photo', 'Cancel']);
+  await snapAll(org, '2c-organizer-adding-a-photo', '#visitors');
+  const [chooser] = await Promise.all([org.waitForEvent('filechooser'), org.click('#visitors .photo-pick button:has-text("Choose a photo")')]);
+  await chooser.setFiles({ name: 'sarah.png', mimeType: 'image/png', buffer: firstPhoto });
+  const inList = await waitForFace(org, '#visitors li .avatar');
+  assert.equal(await org.textContent('#visitors .photo-note'), 'Photo saved. Mary will see it beside Sarah’s name.');
+  assert.deepEqual(await org.locator('#visitors .photo-tools button').allTextContents(), ['Change photo', 'Remove photo']);
+  assert.equal(await org.inputValue('#photo-choose'), '', 'the file input is cleared after each pick');
+  let uploads = await photosSent();
+  assert.equal(uploads.length, 1);
+  assert.equal(uploads[0].type, 'image/jpeg');
+  assert.match(uploads[0].address, /^\/api\/organize\/visitors\/[\w-]+\/photo$/);
+  const sent = inspectJpeg(uploads[0].body);
+  assert.deepEqual([sent.ok, sent.width, sent.height, sent.orientation], [true, 384, 384, 1], 'what was sent is a 384 px square JPEG');
+  assert.ok(uploads[0].body.length < 150 * 1024 && !uploads[0].body.equals(firstPhoto), 'and not the picture that was picked');
+  // The middle square of the picture: teal left, orange right, none of the magenta strips.
+  const isFirst = (face) => face.width === 384 && face.height === 384 && near(face.corners[0], TEAL) && near(face.corners[1], ORANGE) && near(face.corners[2], TEAL) && near(face.corners[3], ORANGE);
+  assert.ok(isFirst(inList), JSON.stringify(inList));
+  await snapAll(org, '2d-organizer-row-with-photo', '#visitors');
+  step('the organizer added a photo of Sarah: a 384 px square cut from the middle was sent');
+
+  // It shows on the home screen straight away, on the card that asks Mary
+  // whether Sarah may visit, with her name beside it as before.
+  const onCard = await waitForFace(home, '.person.pending .avatar');
+  assert.ok(isFirst(onCard), JSON.stringify(onCard));
+  assert.equal(onCard.alt, '', 'the name is beside it, so the picture has no text of its own');
+  assert.match(onCard.src, /^blob:/);
+  assert.deepEqual(onCard.shown, [64, 64]);
+  assert.equal(await home.textContent('.person.pending .person-name'), 'Sarah');
+  assert.equal(homePhotoRequests.length, 1, 'fetched once');
+  assert.match(homePhotoRequests[0], /^GET \/api\/home\/visitors\/[\w-]+\/photo$/);
+  await snapAll(home, '3b-home-approval-card-with-photo');
+  step('the home screen shows the photo on the card that asks Mary');
 
   // Sarah's phone.
   const visitCtx = await browser.newContext({ viewport: { width: 390, height: 844 }, permissions: ['camera', 'microphone'] });
   await visitCtx.addInitScript(watchPeers);
   const visit = await visitCtx.newPage();
+  // A visitor's page is given nothing about photos, and asks for nothing.
+  const visitorPhotoRequests = [];
+  visitCtx.on('request', (request) => { if (/photo/i.test(request.url())) visitorPhotoRequests.push(request.url()); });
   await visit.goto(visitLink);
   await visit.waitForFunction(() => document.querySelector('#state')?.textContent.includes('Waiting for them'));
   assert.equal(await visit.isDisabled('#visit'), true, 'Sarah cannot visit before Mary says yes');
@@ -233,8 +364,17 @@ try {
   await home.waitForSelector('#knock:not([hidden])');
   assert.match(await home.textContent('#knock-title'), /Sarah is here to see you/);
   await snap(home, '6-home-knock');
+  // At the door: her photo, large, the very one already in memory.
+  const atDoor = await waitForFace(home, '#knock-avatar');
+  assert.equal(atDoor.src, onCard.src);
+  assert.ok(isFirst(atDoor));
+  assert.deepEqual(atDoor.shown, [200, 200], 'large on a tablet this size');
+  for (const button of ['#answer', '#decline']) assert.ok(await home.locator(button).isVisible());
+  const lowest = await home.locator('#decline').boundingBox();
+  assert.ok(lowest.y + lowest.height <= 820, 'the two big buttons still fit on the tablet');
+  await snapAll(home, '6b-home-knock-with-photo');
   await home.click('#answer');
-  step('Sarah knocked and Mary answered');
+  step('Sarah knocked (her photo is at the door) and Mary answered');
 
   // Both see and hear each other: video frames arrive on both sides.
   const hasVideo = (page) => page.waitForFunction(() => {
@@ -243,10 +383,17 @@ try {
   }, null, { timeout: 20_000 });
   await Promise.all([hasVideo(home), hasVideo(visit)]);
   assert.match(await home.textContent('#with-you-text'), /Sarah is with you/);
+  // Beside the name, during the visit: the same photo, small.
+  const inVisit = await waitForFace(home, '#with-you-photo');
+  assert.equal(inVisit.src, onCard.src);
+  assert.deepEqual(inVisit.shown, [44, 44]);
+  assert.equal(await home.evaluate(() => { const label = document.querySelector('#with-you'); return [...label.children].map((node) => node.id || node.className).join(' '); }), 'live-dot with-you-photo with-you-text', 'red light, photo, name');
+  assert.equal(await visit.locator('img').count(), 0, 'the visitor’s page shows no photo');
   await home.waitForTimeout(800);
   await snap(home, '7-home-in-visit');
   await snap(visit, '8-visitor-in-visit');
-  step('video and sound flow both ways; the home screen shows who is there');
+  await snapAll(home, '7b-home-in-visit-with-photo');
+  step('video and sound flow both ways; the home screen shows who is there, with their photo');
 
   // Sarah's page says, in one small line, that the visit went directly. The
   // home screen says nothing about how it is connected.
@@ -268,6 +415,31 @@ try {
   // The camera is released on the home screen when the visit ends.
   assert.equal(await home.evaluate(() => document.querySelector('#local').srcObject), null);
   step('Mary ended the visit');
+
+  // Invited, shown, approved, knocked, answered, ended, and the list drawn
+  // again each time: the home screen asked for the photo once in all. A
+  // request at the moment of a visit would tell the host when visits happen.
+  await home.waitForTimeout(300);
+  assert.equal(homePhotoRequests.length, 1, `one request for one photo: ${homePhotoRequests.join(', ')}`);
+  assert.equal((await faceIn(home, '.person .avatar')).src, onCard.src, 'and the list still shows it');
+  step('through all of that the home screen asked for the photo exactly once');
+
+  // The organizer changes the photo, this time with "Take a photo". The file
+  // is one a phone held upright makes: on its side, with a note saying so.
+  await org.click('#visitors .photo-tools button:has-text("Change photo")');
+  await org.setInputFiles('#photo-take', sidewaysPhoto);
+  const isSecond = (face) => face.width === 384 && face.height === 384 && face.corners.every((corner, i) => near(corner, UPRIGHT[i]));
+  const changedInList = await waitForFace(org, '#visitors li .avatar', inList.src);
+  assert.ok(isSecond(changedInList), `upright in the organizer’s list: ${JSON.stringify(changedInList)}`);
+  uploads = await photosSent();
+  assert.equal(uploads.length, 2);
+  assert.ok(fs.readFileSync(sidewaysPhoto).includes('SENTINEL-GPS-METHOD'), 'the file that was picked says where it was taken');
+  assert.ok(!uploads[1].body.includes('Exif') && !uploads[1].body.includes('SENTINEL'), 'what is sent does not');
+  assert.equal(inspectJpeg(uploads[1].body).width, 384);
+  const changed = await waitForFace(home, '.person .avatar', onCard.src);
+  assert.ok(isSecond(changed), `upright on the home screen: ${JSON.stringify(changed)}`);
+  assert.equal(homePhotoRequests.length, 2, 'the new photo was fetched once');
+  step('the organizer changed the photo: it came out upright, and the home screen fetched it exactly once more');
 
   // Sarah knocks again and gives up just as Mary answers, while the tablet's
   // camera is still starting. No visit is left on the home screen (it would
@@ -295,11 +467,49 @@ try {
   await visit.click('#visit');
   await home.waitForSelector('#knock:not([hidden])');
   assert.match(await home.textContent('#knock-title'), /Sarah is coming in/);
+  assert.equal((await waitForFace(home, '#knock-avatar', onCard.src)).src, changed.src, 'the new photo is at the door');
   await snap(home, '9-home-dropin-notice');
   await Promise.all([hasVideo(home), hasVideo(visit)]);
+  assert.equal((await faceIn(home, '#with-you-photo')).src, changed.src);
   step('drop-in connected after the notice');
   await home.click('#end');
   await visit.waitForSelector('#lobby:not([hidden])');
+  assert.equal(homePhotoRequests.length, 2, 'two more knocks and a visit, and no more requests for the photo');
+
+  // A file this browser cannot read as a picture: plain words, and the photo stays.
+  await org.click('#visitors .photo-tools button:has-text("Change photo")');
+  await org.setInputFiles('#photo-choose', { name: 'IMG_0001.HEIC', mimeType: 'image/heic', buffer: Buffer.concat([Buffer.from([0, 0, 0, 0x18]), Buffer.from('ftypheic\0\0\0\0mif1heic not a picture this browser reads')]) });
+  await org.waitForSelector('#visitors .photo-note.bad');
+  assert.equal(await org.textContent('#visitors .photo-note'), 'This kind of photo can’t be read here. Please take a new one or choose a different picture.');
+  assert.equal((await photosSent()).length, 2, 'nothing was sent');
+  assert.equal((await faceIn(org, '#visitors li .avatar')).src, changedInList.src);
+  await snapAll(org, '9b-organizer-photo-cannot-be-read', '#visitors');
+  // A picture the server refuses. The page itself only ever sends a square,
+  // so here the request is changed on its way: a picture that is not square
+  // arrives, the server says no, and the page passes its words on.
+  const anyPhotoRoute = '**/api/organize/visitors/*/photo';
+  const notSquare = (route) => (route.request().method() === 'PUT' ? route.continue({ postData: fs.readFileSync(sidewaysPhoto) }) : route.continue());
+  await org.route(anyPhotoRoute, notSquare);
+  await org.setInputFiles('#photo-choose', { name: 'sarah.png', mimeType: 'image/png', buffer: firstPhoto });
+  await org.waitForFunction(() => document.querySelector('#visitors .photo-note.bad')?.textContent === 'That picture couldn’t be used. Please try another photo.');
+  await org.unroute(anyPhotoRoute, notSquare);
+  assert.equal((await faceIn(org, '#visitors li .avatar')).src, changedInList.src);
+  assert.equal((await faceIn(home, '.person .avatar')).src, changed.src);
+  step('a file that cannot be read, and one the server refuses: plain words, and the photo stays as it was');
+
+  // The organizer removes the photo: the initials are back everywhere, and
+  // the home screen asks for nothing.
+  org.once('dialog', (dialog) => dialog.accept());
+  await org.click('#visitors .photo-tools button:has-text("Remove photo")');
+  await org.waitForFunction(() => !document.querySelector('#visitors li .avatar img'));
+  assert.equal(await initialsIn(org, '#visitors li .avatar'), 'S');
+  assert.deepEqual(await org.locator('#visitors .photo-tools button').allTextContents(), ['Add a photo']);
+  await home.waitForFunction(() => !document.querySelector('.person .avatar img'));
+  assert.equal(await initialsIn(home, '.person .avatar'), 'S');
+  await home.waitForTimeout(300);
+  assert.equal(homePhotoRequests.length, 2, 'removing a photo is not a reason to ask for one');
+  await snapAll(home, '9c-home-list-initials-again');
+  step('the organizer removed the photo: the initials are back, and the home screen asked for nothing');
   // Two visits that connected directly: the relay was never asked for.
   assert.deepEqual(relay.minted, [], 'direct visits make no relay credentials');
   step('direct visits never touched the relay');
@@ -327,8 +537,15 @@ try {
 
   // "?relay=1" on the visitor's link sends the visit through the relay from the start.
   await visit.goto(visitLink.replace('/visit#', '/visit?relay=1#'));
-  await startVisit(visit);
+  await visit.waitForFunction(() => { const b = document.querySelector('#visit'); return b && !b.hidden && !b.disabled; });
+  await visit.click('#visit');
+  await home.waitForSelector('#knock:not([hidden])');
+  // With no photo any more, the door shows her initial, as it always did.
+  assert.equal(await initialsIn(home, '#knock-avatar'), 'S');
+  await snapAll(home, '11a-home-knock-initials');
+  await home.click('#answer');
   await Promise.all([hasVideo(home), hasVideo(visit)]);
+  assert.equal(await home.locator('#with-you-photo').isVisible(), false, 'and no empty circle beside her name');
   await pathLine(visit, 'Connected through the relay.');
   const forced = await chosenPath(visit);
   assert.equal(forced.local, 'relay', 'the browser confirms the visitor is connected through the relay');
@@ -438,6 +655,11 @@ try {
   await stranger.waitForFunction(() => document.querySelector('#title')?.textContent.includes('missing its key'));
   assert.equal(await stranger.isVisible('#visit'), false);
   step('visitor link is remembered on the phone; a bare link shows no button');
+
+  // Photos, at the end of all those visits: two versions, two requests.
+  assert.equal(homePhotoRequests.length, 2, homePhotoRequests.join(', '));
+  assert.deepEqual(visitorPhotoRequests, [], 'Sarah’s phone never asked for anything about a photo');
+  step('photos: the home screen made one request for each version, and the visitor’s phone made none');
 
   // ----- The new address -----
   const hasVideoOn = (...pages) => Promise.all(pages.map(hasVideo));

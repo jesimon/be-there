@@ -4,6 +4,7 @@
 // and their visitor's name show for the whole of every visit.
 import { $, el, initials, rememberedToken, forgetToken, connect, getCamera, stopStream, unlockSound, chime } from './common.js';
 import { startCall } from './peer.js';
+import { getPhotoUrl, cachedPhotoUrl, keepOnlyPhotos, photoFetcher, showFace, createFaces } from './photo.js';
 
 const token = rememberedToken('home');
 let link;
@@ -33,6 +34,37 @@ function tick() {
 setInterval(tick, 10_000);
 tick();
 
+// ----- Photos of the people who visit -----
+// The family's organizer may add a photo for each visitor. It is shown in
+// place of the initials; the name always stays beside it in large letters.
+//
+// A photo is fetched once, when the list of people first names it or names a
+// new version of it, and is then kept in memory. It is never fetched because
+// someone knocks, or a visit starts or ends: the knock screen and the visit
+// use what is already here. So nothing this screen asks the server for can
+// show when a visit happened.
+const fetchPhoto = photoFetcher((id) => `/api/home/visitors/${encodeURIComponent(id)}/photo`, token);
+const faces = createFaces('avatar');
+
+function loadPhotos() {
+  keepOnlyPhotos(home.visitors.map((v) => v.id));
+  for (const v of home.visitors) {
+    const had = cachedPhotoUrl(v.id);
+    getPhotoUrl(v.id, v.photo, fetchPhoto).then((url) => { if (url !== had) showFaces(); });
+  }
+}
+
+// Puts the photos that are in memory on the screen: in the list, and for
+// whoever is at the door or visiting. Asks the server for nothing.
+function showFaces() {
+  for (const v of home?.visitors || []) faces.of(v.id, initials(v.name), cachedPhotoUrl(v.id));
+  if (!call) return;
+  const photo = cachedPhotoUrl(call.visitorId);
+  showFace($('#knock-avatar'), initials(call.name), photo);
+  // Beside "… is with you" a photo is shown only when there is one.
+  showFace($('#with-you-photo'), '', photo);
+}
+
 // ----- The list of people -----
 function render() {
   if (!home) return;
@@ -60,11 +92,15 @@ function render() {
           el('button', { class: 'btn no', type: 'button', onclick: () => send({ type: 'approve', approved: false }) }, 'Not now'),
         ];
     return el('article', { class: `person ${v.approved ? '' : 'pending'}` },
-      el('div', { class: 'avatar' }, initials(v.name)),
+      faces.of(v.id, initials(v.name), cachedPhotoUrl(v.id)),
       el('div', { class: 'person-text' }, el('p', { class: 'person-name' }, v.name), v.relation ? el('p', { class: 'muted' }, v.relation) : null),
       el('div', { class: 'person-controls' }, controls));
   }));
+  faces.keepOnly(home.visitors.map((v) => v.id));
   $('#nobody').hidden = home.visitors.length > 0;
+  // A photo that was changed or taken away goes from the knock screen and
+  // the visit as well.
+  showFaces();
 }
 
 $('#pause').addEventListener('click', () => {
@@ -84,7 +120,7 @@ function showNote(text) {
 function showKnock({ visitorId, name, mode, notice }) {
   showNote('');
   call = { visitorId, name, state: 'ringing' };
-  $('#knock-avatar').textContent = initials(name);
+  showFaces();
   $('#knock').hidden = false;
   chime();
   clearInterval(ringTimer);
@@ -196,6 +232,7 @@ function onMessage(msg) {
   switch (msg.type) {
     case 'state':
       home = msg.home;
+      loadPhotos();
       render();
       break;
     case 'knock':

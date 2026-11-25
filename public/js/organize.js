@@ -1,9 +1,13 @@
 // The organizer page: for the family member who set things up.
-import { $, el, api, tokenFromLink, copyText } from './common.js';
+import { $, el, api, initials, tokenFromLink, copyText } from './common.js';
 import { goToNewAddress, newAddress } from './moved.js';
+import { squarePhoto, getPhotoUrl, cachedPhotoUrl, keepOnlyPhotos, photoFetcher, createFaces } from './photo.js';
 
 let token = tokenFromLink();
 let home = null;
+// The last answer about the home screen and the relay, so the list can be
+// drawn again between two checks with the server.
+let seen = { online: false, relay: 'off' };
 // Where the links made here point: at the new address once there is one,
 // whichever address this page was opened at.
 let linkBase = location.origin;
@@ -28,7 +32,99 @@ function relayResultText(res) {
   return 'The relay service gave an answer we did not expect. Try again in a moment.';
 }
 
+// ----- Photos of visitors -----
+// Only this page adds, changes or removes a visitor's photo. The picture that
+// was picked stays on this device: a small square copy is made here and only
+// that is sent (photo.js). What is shown in the list afterwards is fetched
+// back from the server, so it is exactly what the home screen shows.
+const photoPath = (id) => `/api/organize/visitors/${encodeURIComponent(id)}/photo`;
+const fetchPhoto = photoFetcher(photoPath, () => token);
+const faces = createFaces('avatar small');
+let photoFor = null;      // id of the visitor whose photo is being added or changed
+let photoNote = null;     // { id, text, bad }: a line under that visitor
+let photoBusy = false;
+
+const redraw = () => { if (home) render(seen.online, seen.relay); };
+
+function loadPhotos() {
+  keepOnlyPhotos(home.visitors.map((v) => v.id));
+  for (const v of home.visitors) {
+    const had = cachedPhotoUrl(v.id);
+    getPhotoUrl(v.id, v.photo, fetchPhoto).then((url) => { if (url !== had) redraw(); });
+  }
+}
+
+// Under a visitor's name: "Add a photo", or "Change photo" and "Remove photo".
+function photoTools(v) {
+  const open = photoFor === v.id;
+  return el('div', { class: 'photo-tools' },
+    el('button', { class: 'btn', type: 'button', disabled: photoBusy, 'aria-expanded': String(open), onclick: () => {
+      photoFor = open ? null : v.id;
+      photoNote = null;
+      redraw();
+    } }, v.photo ? 'Change photo' : 'Add a photo'),
+    v.photo ? el('button', { class: 'btn quiet', type: 'button', disabled: photoBusy, onclick: async () => {
+      if (!confirm(`Remove ${v.name}’s photo?`)) return;
+      photoFor = null;
+      photoNote = null;
+      try {
+        await call(photoPath(v.id), { method: 'DELETE' });
+      } catch (err) {
+        photoNote = { id: v.id, text: err.message, bad: true };
+      }
+      load();
+    } }, 'Remove photo') : null);
+}
+
+// Across the foot of a visitor's row: the two ways to pick a photo, while one
+// is being added or changed, and a line saying how it went.
+function photoPanel(v) {
+  const pick = (input) => () => {
+    photoFor = v.id;
+    $(input)?.click();
+  };
+  return [
+    photoFor === v.id ? el('div', { class: 'photo-pick' },
+      el('button', { class: 'btn yes big-btn', type: 'button', disabled: photoBusy, onclick: pick('#photo-take') }, 'Take a photo'),
+      el('button', { class: 'btn big-btn', type: 'button', disabled: photoBusy, onclick: pick('#photo-choose') }, 'Choose a photo'),
+      el('button', { class: 'btn quiet', type: 'button', disabled: photoBusy, onclick: () => { photoFor = null; redraw(); } }, 'Cancel')) : null,
+    photoNote?.id === v.id ? el('p', { class: `photo-note ${photoNote.bad ? 'bad' : ''}`, role: 'status' }, photoNote.text) : null,
+  ];
+}
+
+// A picture was taken or chosen: make the small square copy, send it, show it.
+async function photoPicked(input) {
+  const file = input.files?.[0];
+  // Cleared at once, so that picking the same picture again is noticed too.
+  input.value = '';
+  const v = home?.visitors.find((x) => x.id === photoFor);
+  if (!file || !v || photoBusy) return;
+  const say = (text, bad = false) => { photoNote = { id: v.id, text, bad }; redraw(); };
+  photoBusy = true;
+  say('Adding the photo…');
+  try {
+    const blob = await squarePhoto(file);
+    let res;
+    try {
+      res = await fetch(photoPath(v.id), { method: 'PUT', headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'image/jpeg' }, body: blob });
+    } catch {
+      throw new Error('The photo could not be sent. Please check the connection and try again.');
+    }
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.error || `Something went wrong (${res.status}).`);
+    photoFor = null;
+    photoBusy = false;
+    say(`Photo saved. ${home.personName} will see it beside ${v.name}’s name.`);
+    load();
+  } catch (err) {
+    photoBusy = false;
+    say(err.message, true);
+  }
+}
+for (const id of ['#photo-take', '#photo-choose']) $(id)?.addEventListener('change', (e) => photoPicked(e.target));
+
 function render(online, relay) {
+  seen = { online, relay };
   $('#relay-state').textContent = relay === 'ready' ? 'Relay: ready' : 'Relay: not set up (visits still work on most home networks)';
   $('#title').textContent = home.name;
   for (const n of document.querySelectorAll('.person-name-inline')) n.textContent = home.personName;
@@ -42,13 +138,18 @@ function render(online, relay) {
     $('#hours').end.value = home.hours.end;
   }
   $('#visitors').replaceChildren(...(home.visitors.length ? home.visitors.map((v) => el('li', {},
-    el('span', { class: 'visitor-name' }, v.name, v.relation ? el('span', { class: 'muted' }, ` · ${v.relation}`) : null),
+    faces.of(v.id, initials(v.name), cachedPhotoUrl(v.id)),
+    el('div', { class: 'visitor-main' },
+      el('span', { class: 'visitor-name' }, v.name, v.relation ? el('span', { class: 'muted' }, ` · ${v.relation}`) : null),
+      photoTools(v)),
     el('span', { class: `tag ${v.approved ? 'ok' : 'wait'}` }, v.approved ? (v.mode === 'dropin' ? 'Can come straight in' : 'Knocks first') : `Waiting for ${home.personName} to say yes`),
     el('button', { class: 'btn quiet', type: 'button', onclick: async () => {
       if (!confirm(`Remove ${v.name}? Their link will stop working.`)) return;
       await call(`/api/organize/visitors/${encodeURIComponent(v.id)}`, { method: 'DELETE' });
       load();
-    } }, 'Remove'))) : [el('li', { class: 'muted' }, 'Nobody yet. Invite the first person below.')]));
+    } }, 'Remove'),
+    photoPanel(v))) : [el('li', { class: 'muted' }, 'Nobody yet. Invite the first person below.')]));
+  faces.keepOnly(home.visitors.map((v) => v.id));
   $('#content').hidden = false;
 }
 
@@ -56,6 +157,7 @@ async function load() {
   try {
     const res = await call('/api/organize');
     home = res.home;
+    loadPhotos();
     render(res.online, res.relay);
   } catch (err) {
     $('#title').textContent = 'Be There';

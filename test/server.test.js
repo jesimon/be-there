@@ -2,7 +2,9 @@
 // answering, passing signals, and ending. Then the relay: who may ask for it,
 // who is told, and that its credentials stop working when the visit ends.
 // The relay is always a fake here: nothing in these tests talks to Cloudflare.
-// Last, the new address: which one is accepted, and that both are served alike.
+// Then the new address: which one is accepted, and that both are served alike.
+// Last, visitors' photos: who may add, change, remove and see them, what is
+// kept, and that none of it is logged or written into the repository.
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
@@ -12,10 +14,32 @@ import http from 'node:http';
 import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
+import zlib from 'node:zlib';
 import { fileURLToPath } from 'node:url';
 import WebSocket from 'ws';
 import { startServer, createApp } from '../server.js';
 import { createStore } from '../lib/store.js';
+import { photosInMemory } from '../lib/photos.js';
+import { acceptPhoto, JFIF_START } from '../lib/jpeg.js';
+
+// Every file in the repository (but not what is installed, or git's own), with
+// its size and when it was last written: taken now, and compared at the very
+// end, to show that these tests write nothing into the repository.
+const repository = fileURLToPath(new URL('..', import.meta.url));
+function repositoryFiles() {
+  const found = {};
+  const look = (dir) => {
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      if (['node_modules', '.git'].includes(entry.name)) continue;
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) look(full);
+      else { const stat = fs.statSync(full); found[path.relative(repository, full)] = `${stat.size} bytes, written ${stat.mtimeMs}`; }
+    }
+  };
+  look(repository);
+  return found;
+}
+const repositoryBefore = repositoryFiles();
 
 let srv;
 before(async () => { srv = await startServer({ port: 0, store: createStore(':memory:'), setupPassword: 'open-sesame', env: {} }); });
@@ -76,7 +100,7 @@ test('pages are private and carry safe headers', async () => {
 });
 
 test('pages, scripts and styles are checked with the server every time', async () => {
-  for (const file of ['/', '/home', '/visit', '/organize', '/setup', '/setup.html', '/js/common.js', '/js/peer.js', '/js/moved.js', '/js/home.js', '/js/visit.js', '/js/organize.js', '/js/setup.js', '/css/style.css']) {
+  for (const file of ['/', '/home', '/visit', '/organize', '/setup', '/setup.html', '/js/common.js', '/js/peer.js', '/js/moved.js', '/js/photo.js', '/js/home.js', '/js/visit.js', '/js/organize.js', '/js/setup.js', '/css/style.css']) {
     const r = await fetch(srv.url + file);
     assert.equal(r.status, 200, file);
     assert.equal(r.headers.get('cache-control'), 'no-cache', file);
@@ -250,8 +274,7 @@ const until = async (check, what = 'condition') => {
 
 // A server of its own with a fake relay. Homes are made straight in the store,
 // so the tests are not slowed by the limit on creating homes.
-async function world(t, { relay = fakeRelay(), now, env = {} } = {}) {
-  const store = createStore(':memory:');
+async function world(t, { relay = fakeRelay(), now, env = {}, store = createStore(':memory:') } = {}) {
   const server = await startServer({ port: 0, store, setupPassword: '', env, relay, ...(now ? { now } : {}) });
   let closed = false;
   const close = async () => { if (!closed) { closed = true; await server.close(); } };
@@ -866,7 +889,7 @@ test('both addresses are served alike: 200 for either Host, and never a redirect
       { Host: 'some-other-name.example' },
     ];
     const paths = ['/healthz', '/', '/home', '/visit', '/organize', '/setup', '/visit?relay=1', '/api/config', '/api/setup-info',
-      '/js/moved.js', '/js/common.js', '/js/home.js', '/js/visit.js', '/js/organize.js', '/js/setup.js', '/js/peer.js', '/css/style.css', '/favicon.svg'];
+      '/js/moved.js', '/js/photo.js', '/js/common.js', '/js/home.js', '/js/visit.js', '/js/organize.js', '/js/setup.js', '/js/peer.js', '/css/style.css', '/favicon.svg'];
     for (const pathname of paths) {
       let first = null;
       for (const headers of hosts) {
@@ -1048,4 +1071,483 @@ test('starting the server: one plain line about the new address, and a wrong val
   assert.match(wrong, /^CANONICAL_ORIGIN is set to an address this version does not know, so it is ignored\. Nothing moves\.$/m);
   assert.equal(wrong.match(/CANONICAL_ORIGIN/g).length, 1, 'said once');
   assert.doesNotMatch(wrong, /evil|secret-path|New address/);
+});
+
+// ---------------------------------------------------------------------------
+// Photos of visitors
+// ---------------------------------------------------------------------------
+
+const picture = (name) => fs.readFileSync(new URL(`./fixtures/${name}`, import.meta.url));
+// What the organizer's page sends (a browser's canvas made it), and another.
+const CANVAS = picture('canvas-384.jpg');
+const GREY = picture('grey-256.jpg');
+const KEPT = acceptPhoto(CANVAS);
+const KEPT_GREY = acceptPhoto(GREY);
+const REFUSED = 'That picture couldn’t be used. Please try another photo.';
+const organizePhoto = (id) => `/api/organize/visitors/${id}/photo`;
+const homePhoto = (id) => `/api/home/visitors/${id}/photo`;
+
+// One request whose body and answer are bytes, as a photo is.
+const bytesOn = (server) => async (pathname, { token, method = 'GET', body, type = body ? 'image/jpeg' : null, headers = {} } = {}) => {
+  const res = await fetch(server.url + pathname, {
+    method,
+    headers: { ...(token ? { Authorization: `Bearer ${token}` } : {}), ...(type ? { 'Content-Type': type } : {}), ...headers },
+    body,
+  });
+  const bytes = Buffer.from(await res.arrayBuffer());
+  let json = null;
+  try { json = JSON.parse(bytes.toString('utf8')); } catch { /* a picture, not JSON */ }
+  return { status: res.status, headers: res.headers, bytes, body: json };
+};
+// A world whose answers can be read as bytes, with a home (Sarah and Tom)
+// and a second home (Ann) beside it.
+async function photoWorld(t, options) {
+  const w = await world(t, options);
+  w.bytes = bytesOn(w.server);
+  w.put = (id, token, body = CANVAS, more = {}) => w.bytes(organizePhoto(id), { method: 'PUT', token, body, ...more });
+  const mary = await w.household(['Sarah', 'Tom']);
+  const joe = await w.household(['Ann']);
+  const tagOf = (h, n = 0) => w.store.getHome(h.home.id).visitors.filter((v) => !v.removed)[n]?.photo?.etag ?? null;
+  return { w, mary, joe, sarahId: mary.people[0].id, tomId: mary.people[1].id, annId: joe.people[0].id, tagOf };
+}
+
+test('photos: only the organizer’s link can add, change or remove one', async (t) => {
+  const { w, mary, joe, sarahId, tomId, annId, tagOf } = await photoWorld(t);
+  const strangers = { 'no link': undefined, 'a made-up link': 'not-a-real-token', 'the home screen’s link': mary.homeToken, 'the visitor’s own link': mary.people[0].token, 'another visitor’s link': mary.people[1].token, 'another home’s screen': joe.homeToken };
+  const nobody = async (when) => {
+    for (const [who, token] of Object.entries(strangers)) {
+      assert.equal((await w.put(sarahId, token)).status, 401, `${who} adding, ${when}`);
+      assert.equal((await w.put(sarahId, token, GREY)).status, 401, `${who} changing, ${when}`);
+      assert.equal((await w.bytes(organizePhoto(sarahId), { method: 'DELETE', token })).status, 401, `${who} removing, ${when}`);
+      const read = await w.bytes(organizePhoto(sarahId), { token });
+      assert.equal(read.status, 401, `${who} reading through the organizer’s route, ${when}`);
+      assert.ok(!read.bytes.includes(JFIF_START));
+    }
+    // An organizer of another home has a working link, but not for this visitor.
+    for (const method of ['PUT', 'DELETE', 'GET']) {
+      const res = await w.bytes(organizePhoto(sarahId), { method, token: joe.organizerToken, ...(method === 'PUT' ? { body: GREY } : {}) });
+      assert.equal(res.status, 404, `another home’s organizer, ${method}, ${when}`);
+      assert.deepEqual(res.body, { error: 'No such visitor.' });
+    }
+  };
+
+  await nobody('before there is a photo');
+  assert.equal(tagOf(mary), null);
+  assert.equal(w.store.photoBytes(mary.home, sarahId), null);
+
+  // The organizer adds one.
+  const added = await w.put(sarahId, mary.organizerToken);
+  assert.equal(added.status, 200);
+  assert.deepEqual(added.body, { photo: KEPT.etag });
+  assert.equal(tagOf(mary), KEPT.etag);
+  assert.ok(w.store.photoBytes(mary.home, sarahId).equals(KEPT.bytes), 'what is kept is the rebuilt picture');
+  assert.equal(tagOf(mary, 1), null, 'only that visitor’s');
+  assert.equal(tagOf(joe), null);
+
+  await nobody('once there is a photo');
+  assert.equal(tagOf(mary), KEPT.etag, 'nobody else changed or removed it');
+  assert.ok(w.store.photoBytes(mary.home, sarahId).equals(KEPT.bytes));
+
+  // The organizer changes it, then removes it.
+  const changed = await w.put(sarahId, mary.organizerToken, GREY);
+  assert.deepEqual([changed.status, changed.body], [200, { photo: KEPT_GREY.etag }]);
+  assert.notEqual(KEPT_GREY.etag, KEPT.etag);
+  assert.ok(w.store.photoBytes(mary.home, sarahId).equals(KEPT_GREY.bytes));
+  const removed = await w.bytes(organizePhoto(sarahId), { method: 'DELETE', token: mary.organizerToken });
+  assert.deepEqual([removed.status, removed.body], [200, { ok: true }]);
+  assert.equal(tagOf(mary), null);
+  assert.equal(w.store.photoBytes(mary.home, sarahId), null);
+  assert.equal((await w.bytes(organizePhoto(sarahId), { method: 'DELETE', token: mary.organizerToken })).status, 200, 'removing what is not there is fine');
+
+  // Not for someone who is not a visitor, or who has been removed.
+  for (const id of ['no-such-visitor', annId, '..%2f..%2fdb.json', '%00', 'a'.repeat(300)]) {
+    const res = await w.put(id, mary.organizerToken);
+    assert.deepEqual([res.status, res.body], [404, { error: 'No such visitor.' }], id);
+  }
+  // A path that climbs is not a photo route at all.
+  for (const id of ['..', '%2e%2e', '.']) assert.equal((await w.put(id, mary.organizerToken)).status, 404, id);
+  assert.equal(tagOf(joe), null);
+  assert.equal((await w.req(`/api/organize/visitors/${tomId}`, { token: mary.organizerToken, method: 'DELETE' })).status, 200);
+  assert.equal((await w.put(tomId, mary.organizerToken)).status, 404);
+  assert.equal(w.store.photoBytes(mary.home, tomId), null);
+});
+
+test('photos: the home screen can fetch those of its own visitors, and nobody else’s', async (t) => {
+  const { w, mary, joe, sarahId, tomId, annId } = await photoWorld(t);
+  assert.equal((await w.put(sarahId, mary.organizerToken)).status, 200);
+  assert.equal((await w.put(annId, joe.organizerToken, GREY)).status, 200);
+
+  // Its own visitor's photo, with its own link's secret.
+  const own = await w.bytes(homePhoto(sarahId), { token: mary.homeToken });
+  assert.equal(own.status, 200);
+  assert.ok(own.bytes.equals(KEPT.bytes));
+  // The organizer sees the same picture through their own route.
+  const viaOrganizer = await w.bytes(organizePhoto(sarahId), { token: mary.organizerToken });
+  assert.equal(viaOrganizer.status, 200);
+  assert.ok(viaOrganizer.bytes.equals(KEPT.bytes));
+
+  // No link, or a link that is not a home screen's: turned away.
+  const notHome = { 'no link': undefined, 'a made-up link': 'not-a-real-token', 'the organizer’s link': mary.organizerToken, 'the visitor’s own link': mary.people[0].token, 'another visitor’s link': mary.people[1].token };
+  for (const [who, token] of Object.entries(notHome)) {
+    const res = await w.bytes(homePhoto(sarahId), { token });
+    assert.equal(res.status, 401, who);
+    assert.match(res.body.error, /home screen link/);
+    assert.ok(!res.bytes.includes(JFIF_START), who);
+  }
+  // Knowing the ids, or even the photo's tag, is not having the link. And the
+  // secret counts only where a link secret may travel: never in the address.
+  const address = `${homePhoto(sarahId)}?home=${mary.home.id}&token=${mary.homeToken}&access_token=${mary.homeToken}&authorization=Bearer%20${mary.homeToken}`;
+  assert.equal((await w.bytes(address)).status, 401, 'the secret in the address');
+  for (const guess of [mary.home.id, sarahId, KEPT.etag, `${mary.home.id}:${sarahId}`]) {
+    assert.equal((await w.bytes(`${homePhoto(sarahId)}?home=${mary.home.id}`, { token: guess })).status, 401, 'an id in place of the secret');
+    assert.equal((await w.bytes(`${organizePhoto(sarahId)}?home=${mary.home.id}`, { token: guess })).status, 401);
+  }
+  assert.equal((await w.bytes(`${organizePhoto(sarahId)}?token=${mary.organizerToken}`)).status, 401);
+  assert.equal((await w.bytes(homePhoto(sarahId), { headers: { Authorization: mary.homeToken } })).status, 401, 'the secret without “Bearer”');
+  assert.equal((await w.bytes(homePhoto(sarahId), { headers: { Cookie: `token=${mary.homeToken}`, 'X-Token': mary.homeToken } })).status, 401);
+  // Another home's visitor is simply not found, as is anyone without a photo.
+  const notFound = { 'another home’s visitor': [annId, mary.homeToken], 'our visitor, asked for by another home': [sarahId, joe.homeToken], 'a visitor with no photo': [tomId, mary.homeToken], 'nobody': ['no-such-visitor', mary.homeToken], 'a path that climbs': ['..%2f..%2fdb.json', mary.homeToken] };
+  for (const [what, [id, token]] of Object.entries(notFound)) {
+    const res = await w.bytes(homePhoto(id), { token });
+    assert.deepEqual([res.status, res.body], [404, { error: 'No photo.' }], what);
+  }
+  assert.ok((await w.bytes(homePhoto(annId), { token: joe.homeToken })).bytes.equals(KEPT_GREY.bytes));
+
+  // A visitor's link opens no photo route at all, not even for their own picture.
+  const visitorToken = mary.people[0].token;
+  for (const pathname of ['/api/visit/photo', `/api/visit/visitors/${sarahId}/photo`, `/api/visitors/${sarahId}/photo`, `/api/visit/${sarahId}/photo`, '/api/photo']) {
+    for (const method of ['GET', 'PUT', 'DELETE']) {
+      const res = await w.bytes(pathname, { method, token: visitorToken, ...(method === 'PUT' ? { body: CANVAS } : {}) });
+      assert.equal(res.status, 404, `${method} ${pathname}`);
+      assert.ok(!res.bytes.includes(JFIF_START));
+    }
+  }
+  // Only reading is offered to the home screen.
+  for (const method of ['PUT', 'DELETE', 'POST']) {
+    assert.equal((await w.bytes(homePhoto(sarahId), { method, token: mary.homeToken, ...(method === 'DELETE' ? {} : { body: GREY }) })).status, 404, method);
+  }
+  assert.ok(w.store.photoBytes(mary.home, sarahId).equals(KEPT.bytes));
+
+  // A replaced home screen link stops working for photos too; the new one works.
+  const { homeToken: newToken } = (await w.req('/api/organize/home-link', { token: mary.organizerToken, method: 'POST' })).body;
+  assert.equal((await w.bytes(homePhoto(sarahId), { token: mary.homeToken })).status, 401);
+  assert.equal((await w.bytes(homePhoto(sarahId), { token: newToken })).status, 200);
+
+  // The visitor is removed: their photo cannot be fetched any more.
+  assert.equal((await w.req(`/api/organize/visitors/${sarahId}`, { token: mary.organizerToken, method: 'DELETE' })).status, 200);
+  assert.equal((await w.bytes(homePhoto(sarahId), { token: newToken })).status, 404);
+  assert.equal((await w.bytes(organizePhoto(sarahId), { token: mary.organizerToken })).status, 404);
+});
+
+test('photos: a photo is sent with exactly these headers, and “not changed” when the tag matches', async (t) => {
+  const { w, mary, sarahId } = await photoWorld(t);
+  assert.equal((await w.put(sarahId, mary.organizerToken)).status, 200);
+  const routes = { 'to the home screen': [homePhoto(sarahId), mary.homeToken], 'to the organizer': [organizePhoto(sarahId), mary.organizerToken] };
+  for (const [name, [pathname, token]] of Object.entries(routes)) {
+    const res = await w.bytes(pathname, { token });
+    assert.equal(res.status, 200, name);
+    const got = Object.fromEntries(['content-type', 'x-content-type-options', 'content-disposition', 'content-security-policy', 'cross-origin-resource-policy', 'cache-control', 'vary', 'etag', 'content-length'].map((h) => [h, res.headers.get(h)]));
+    assert.deepEqual(got, {
+      'content-type': 'image/jpeg',
+      'x-content-type-options': 'nosniff',
+      'content-disposition': 'attachment; filename="photo.jpg"',
+      'content-security-policy': "default-src 'none'; sandbox",
+      'cross-origin-resource-policy': 'same-origin',
+      'cache-control': 'private, no-cache',
+      vary: 'Authorization',
+      etag: `"${KEPT.etag}"`,
+      'content-length': String(KEPT.bytes.length),
+    }, name);
+    // What every answer from this server carries is still there.
+    assert.equal(res.headers.get('x-robots-tag'), 'noindex, nofollow');
+    assert.equal(res.headers.get('referrer-policy'), 'no-referrer');
+    assert.equal(res.headers.get('x-frame-options'), 'DENY');
+    assert.ok(res.bytes.equals(KEPT.bytes), name);
+    assert.ok(res.bytes.subarray(0, 20).equals(JFIF_START));
+
+    // The same tag: 304, with no picture.
+    for (const tag of [`"${KEPT.etag}"`, `W/"${KEPT.etag}"`, `"something-else", "${KEPT.etag}"`, '*']) {
+      const same = await w.bytes(pathname, { token, headers: { 'If-None-Match': tag } });
+      assert.equal(same.status, 304, `${name}, ${tag}`);
+      assert.equal(same.bytes.length, 0);
+      assert.deepEqual([same.headers.get('etag'), same.headers.get('cache-control'), same.headers.get('vary')], [`"${KEPT.etag}"`, 'private, no-cache', 'Authorization']);
+    }
+    // Another tag, or the tag without its quotes: the picture.
+    for (const tag of ['"something-else"', KEPT.etag, `"${KEPT_GREY.etag}"`, '']) {
+      const other = await w.bytes(pathname, { token, headers: { 'If-None-Match': tag } });
+      assert.equal(other.status, 200, `${name}, ${tag}`);
+      assert.ok(other.bytes.equals(KEPT.bytes));
+    }
+    // Knowing the tag does not get anyone past the door.
+    for (const wrong of [undefined, 'not-a-real-token', mary.people[0].token]) {
+      assert.equal((await w.bytes(pathname, { token: wrong, headers: { 'If-None-Match': `"${KEPT.etag}"` } })).status, 401, name);
+    }
+  }
+  // After a change the old tag no longer matches.
+  assert.equal((await w.put(sarahId, mary.organizerToken, GREY)).status, 200);
+  const after = await w.bytes(homePhoto(sarahId), { token: mary.homeToken, headers: { 'If-None-Match': `"${KEPT.etag}"` } });
+  assert.equal(after.status, 200);
+  assert.equal(after.headers.get('etag'), `"${KEPT_GREY.etag}"`);
+  assert.ok(after.bytes.equals(KEPT_GREY.bytes));
+  // The answers that are not a picture do not pretend to be one.
+  const missing = await w.bytes(homePhoto('no-such-visitor'), { token: mary.homeToken });
+  assert.match(missing.headers.get('content-type'), /^application\/json/);
+  assert.equal(missing.headers.get('etag') === `"${KEPT_GREY.etag}"`, false);
+});
+
+test('photos: sent as anything but a JPEG picture is 415, and too large is 413', async (t) => {
+  const { w, mary, sarahId, tagOf } = await photoWorld(t);
+  const send = (more) => w.put(sarahId, mary.organizerToken, CANVAS, more);
+  for (const type of ['image/png', 'application/octet-stream', 'text/plain', 'multipart/form-data; boundary=x', '']) {
+    const res = await send({ type });
+    assert.equal(res.status, 415, `sent as “${type}”`);
+    assert.deepEqual(res.body, { error: 'A photo must be sent as a JPEG picture.' });
+  }
+  // JSON is read by the reader every route shares: still not a photo.
+  assert.equal((await w.put(sarahId, mary.organizerToken, JSON.stringify({ photo: CANVAS.toString('base64') }), { type: 'application/json' })).status, 415);
+  // A compressed body is never unpacked (50 MB of nothing packs into a few KB).
+  const packed = zlib.gzipSync(Buffer.alloc(50 * 1024 * 1024));
+  assert.ok(packed.length < 100 * 1024);
+  const gz = await w.put(sarahId, mary.organizerToken, packed, { headers: { 'Content-Encoding': 'gzip' } });
+  assert.deepEqual([gz.status, gz.body], [415, { error: 'A photo must be sent as a JPEG picture.' }]);
+  assert.equal(tagOf(mary), null, 'none of those was kept');
+  // "image/jpeg" with a parameter after it is still a JPEG.
+  assert.equal((await send({ type: 'image/jpeg; charset=binary' })).status, 200);
+  assert.ok(w.store.photoBytes(mary.home, sarahId).equals(KEPT.bytes));
+
+  // One byte over 200 KB, and a good deal over.
+  const sizes = await photoWorld(t);
+  const sendSized = (length) => sizes.w.put(sizes.sarahId, sizes.mary.organizerToken, Buffer.concat([CANVAS, Buffer.alloc(length - CANVAS.length)]));
+  for (const length of [200 * 1024 + 1, 500 * 1024]) {
+    const res = await sendSized(length);
+    assert.equal(res.status, 413, `${length} bytes`);
+    assert.deepEqual(res.body, { error: 'That photo is too large. Please try another photo.' });
+  }
+  assert.equal(sizes.tagOf(sizes.mary), null);
+  // Exactly 200 KB is let in (and what came after the picture is dropped).
+  const full = await sendSized(200 * 1024);
+  assert.deepEqual([full.status, full.body], [200, { photo: KEPT.etag }]);
+  assert.ok(sizes.w.store.photoBytes(sizes.mary.home, sizes.sarahId).equals(KEPT.bytes));
+});
+
+test('photos: a picture that is not what we accept is refused in plain words, and nothing changes', async (t) => {
+  const { w, mary, sarahId, tagOf } = await photoWorld(t);
+  assert.equal((await w.put(sarahId, mary.organizerToken)).status, 200);
+  const base = picture('baseline-256.jpg');
+  const sof = base.indexOf(Buffer.from([0xff, 0xc0, 0x00, 0x11]));
+  const adobe = Buffer.concat([base.subarray(0, 2), Buffer.from([0xff, 0xee, 0x00, 0x0e]), Buffer.from('Adobe\0d\0\0\0\0\x01', 'latin1'), base.subarray(2)]);
+  const bad = {
+    not_jpeg: Buffer.from('89504e470d0a1a0a0000000d49484452', 'hex'),
+    not_square: picture('sideways-320x240.jpg'),
+    not_upright: picture('orientation-6-256.jpg'),
+    truncated: base.subarray(0, base.length - 2),
+    too_many_pixels: (() => { const b = Buffer.from(base); b.writeUInt16BE(513, sof + 5); b.writeUInt16BE(513, sof + 7); return b; })(),
+    too_small: (() => { const b = Buffer.from(base); b.writeUInt16BE(95, sof + 5); b.writeUInt16BE(95, sof + 7); return b; })(),
+    adobe_marker: adobe,
+    second_image: Buffer.concat([base.subarray(0, 2), base]),
+  };
+  for (const [reason, body] of Object.entries(bad)) {
+    const res = await w.put(sarahId, mary.organizerToken, body);
+    assert.equal(res.status, 400, reason);
+    assert.deepEqual(res.body, { error: REFUSED, reason });
+    assert.match(res.headers.get('content-type'), /^application\/json/);
+  }
+  // The photo that was there is still there, untouched.
+  assert.equal(tagOf(mary), KEPT.etag);
+  assert.ok((await w.bytes(homePhoto(sarahId), { token: mary.homeToken })).bytes.equals(KEPT.bytes));
+});
+
+test('photos: where it was taken, and anything hidden in the file, never reaches the store or the home screen', async (t) => {
+  const { w, mary, sarahId } = await photoWorld(t);
+  const src = picture('metadata-256.jpg');
+  const dirty = Buffer.concat([src, Buffer.from('<script>alert(1)</script>PK\x03\x04 SENTINEL-TAIL')]);
+  for (const word of ['SENTINEL-GPS-METHOD', 'SENTINEL-MAKE', 'SENTINEL-COMMENT', 'SENTINEL-XMP', 'Exif', 'ICC_PROFILE', '<script>']) assert.ok(dirty.includes(word));
+  const res = await w.put(sarahId, mary.organizerToken, dirty);
+  assert.equal(res.status, 200);
+  for (const kept of [w.store.photoBytes(mary.home, sarahId), (await w.bytes(homePhoto(sarahId), { token: mary.homeToken })).bytes]) {
+    for (const word of ['SENTINEL', 'Exif', 'ICC_PROFILE', 'xmpmeta', 'Photoshop', '<script', 'PK\x03\x04', 'Example Road']) assert.ok(!kept.includes(word), `${word} is gone`);
+    assert.ok(kept.subarray(0, 20).equals(JFIF_START));
+    assert.equal(kept.subarray(-2).toString('hex'), 'ffd9');
+    assert.ok(kept.equals(acceptPhoto(picture('baseline-256.jpg')).bytes), 'only the picture is left');
+  }
+});
+
+test('photos: the home screen and the organizer are told the tag at once; a visitor is never told anything', async (t) => {
+  const { w, mary, joe, sarahId, tomId } = await photoWorld(t);
+  const { homeScreen, sarah } = mary;
+  const tom = mary.people[1].socket;
+  const tags = (msg) => msg.home.visitors.map((v) => v.photo);
+  assert.deepEqual(tags((await w.req('/api/organize', { token: mary.organizerToken })).body), [null, null]);
+
+  // Added: the home screen hears straight away, with nobody having to approve it.
+  assert.equal((await w.put(sarahId, mary.organizerToken)).status, 200);
+  assert.deepEqual(tags(await homeScreen.next('state', (m) => m.home.visitors[0]?.photo)), [KEPT.etag, null]);
+  assert.deepEqual(tags((await w.req('/api/organize', { token: mary.organizerToken })).body), [KEPT.etag, null]);
+  // Changed, for the other visitor too.
+  assert.equal((await w.put(sarahId, mary.organizerToken, GREY)).status, 200);
+  assert.deepEqual(tags(await homeScreen.next('state', (m) => m.home.visitors[0]?.photo === KEPT_GREY.etag)), [KEPT_GREY.etag, null]);
+  assert.equal((await w.put(tomId, mary.organizerToken)).status, 200);
+  assert.deepEqual(tags(await homeScreen.next('state', (m) => m.home.visitors[1]?.photo)), [KEPT_GREY.etag, KEPT.etag]);
+  // Removed.
+  assert.equal((await w.bytes(organizePhoto(sarahId), { method: 'DELETE', token: mary.organizerToken })).status, 200);
+  assert.deepEqual(tags(await homeScreen.next('state', (m) => m.home.visitors[1]?.photo && m.home.visitors[0].photo === null)), [null, KEPT.etag]);
+  // Removing again changes nothing, so nobody is told again.
+  const told = homeScreen.seen.filter((m) => m.type === 'state').length;
+  assert.equal((await w.bytes(organizePhoto(sarahId), { method: 'DELETE', token: mary.organizerToken })).status, 200);
+  assert.equal((await w.put(sarahId, mary.organizerToken)).status, 200);
+  await homeScreen.next('state', (m) => m.home.visitors[0]?.photo === KEPT.etag);
+  assert.equal(homeScreen.seen.filter((m) => m.type === 'state').length, told + 1);
+  // The other home hears nothing of it.
+  assert.doesNotMatch(JSON.stringify(joe.homeScreen.seen), new RegExp(`${KEPT.etag}|${KEPT_GREY.etag}`));
+
+  // A whole visit, with photos on both visitors: Sarah knocks, is answered, signals, and it ends.
+  sarah.send({ type: 'knock' });
+  const knock = await homeScreen.next('knock');
+  assert.deepEqual(Object.keys(plain(knock)).sort(), ['mode', 'name', 'notice', 'type', 'visitorId'], 'a knock names the visitor; the photo is the one the screen already has');
+  homeScreen.send({ type: 'answer', visitorId: sarahId });
+  await sarah.next('answered');
+  await settled({ homeScreen, sarah });
+  homeScreen.send({ type: 'end' });
+  await sarah.next('ended');
+  await tom.next('status', (m) => m.view.canVisit);
+
+  // Nothing either visitor was ever sent, or can ask for, mentions a photo.
+  const tagWords = new RegExp(`photo|etag|${KEPT.etag}|${KEPT_GREY.etag}`, 'i');
+  for (const person of mary.people) {
+    assert.ok(person.socket.seen.length >= 3);
+    assert.doesNotMatch(JSON.stringify(person.socket.seen), tagWords);
+    const view = await w.req('/api/visit', { token: person.token });
+    assert.equal(view.status, 200);
+    assert.doesNotMatch(view.text, tagWords);
+    assert.deepEqual(Object.keys(view.body.you).sort(), ['approved', 'mode', 'name']);
+  }
+  // What is open to anyone says nothing either.
+  for (const pathname of ['/api/config', '/api/setup-info', '/healthz']) assert.doesNotMatch((await w.req(pathname)).text, tagWords, pathname);
+  // Inviting someone still answers as it did.
+  const invited = await w.req('/api/organize/visitors', { token: mary.organizerToken, method: 'POST', body: { name: 'Una' } });
+  assert.deepEqual(Object.keys(invited.body.visitor).sort(), ['approved', 'id', 'mode', 'name', 'relation']);
+});
+
+test('photos: kept as one small file beside the data file; gone when the photo, the visitor or the home goes', async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'be-there-test-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const photosDir = path.join(dir, 'photos');
+  const files = () => (fs.existsSync(photosDir) ? fs.readdirSync(photosDir, { recursive: true, withFileTypes: true }).filter((e) => e.isFile()).map((e) => path.relative(photosDir, path.join(e.parentPath, e.name))).sort() : []);
+  const { w, mary, joe, sarahId, tomId, annId } = await photoWorld(t, { store: createStore(path.join(dir, 'db.json')) });
+  assert.deepEqual(files(), []);
+
+  assert.equal((await w.put(sarahId, mary.organizerToken)).status, 200);
+  assert.equal((await w.put(tomId, mary.organizerToken, GREY)).status, 200);
+  assert.equal((await w.put(annId, joe.organizerToken)).status, 200);
+  const fileOf = (h, id) => path.join(h.home.id, `${id}.jpg`);
+  assert.deepEqual(files(), [fileOf(mary, sarahId), fileOf(mary, tomId), fileOf(joe, annId)].sort());
+  assert.ok(fs.readFileSync(path.join(photosDir, fileOf(mary, sarahId))).equals(KEPT.bytes), 'the file is the rebuilt picture');
+  // The data file holds the tags and not the pictures.
+  const data = fs.readFileSync(path.join(dir, 'db.json'), 'utf8');
+  assert.match(data, new RegExp(KEPT.etag));
+  assert.ok(data.length < 5000);
+
+  // A refused change, and a change: still one file for her.
+  assert.equal((await w.put(sarahId, mary.organizerToken, picture('sideways-320x240.jpg'))).status, 400);
+  assert.equal((await w.put(sarahId, mary.organizerToken, GREY)).status, 200);
+  assert.deepEqual(files().length, 3);
+  assert.ok(fs.readFileSync(path.join(photosDir, fileOf(mary, sarahId))).equals(KEPT_GREY.bytes));
+
+  // The photo is removed.
+  assert.equal((await w.bytes(organizePhoto(sarahId), { method: 'DELETE', token: mary.organizerToken })).status, 200);
+  assert.deepEqual(files(), [fileOf(mary, tomId), fileOf(joe, annId)].sort());
+  // The visitor is removed.
+  assert.equal((await w.req(`/api/organize/visitors/${tomId}`, { token: mary.organizerToken, method: 'DELETE' })).status, 200);
+  assert.deepEqual(files(), [fileOf(joe, annId)]);
+  assert.doesNotMatch(fs.readFileSync(path.join(dir, 'db.json'), 'utf8').split(joe.home.id)[0], /"photo"/, 'no tag is left on the first home’s visitors');
+  // The home is deleted: its whole folder goes; the other home's is untouched.
+  assert.equal((await w.put(sarahId, mary.organizerToken)).status, 200);
+  assert.equal(fs.existsSync(path.join(photosDir, mary.home.id)), true);
+  assert.equal((await w.req('/api/organize/home', { token: mary.organizerToken, method: 'DELETE' })).status, 200);
+  assert.equal(fs.existsSync(path.join(photosDir, mary.home.id)), false);
+  assert.deepEqual(files(), [fileOf(joe, annId)]);
+  assert.equal((await w.bytes(homePhoto(sarahId), { token: mary.homeToken })).status, 401);
+  assert.equal((await w.put(sarahId, mary.organizerToken)).status, 401);
+  assert.ok((await w.bytes(homePhoto(annId), { token: joe.homeToken })).bytes.equals(KEPT.bytes));
+  // Nothing else was written in that folder.
+  assert.deepEqual(fs.readdirSync(dir).sort(), ['db.json', 'photos']);
+});
+
+test('photos: with a store kept in memory, as these tests use, the pictures are in memory too', async (t) => {
+  const photos = photosInMemory();
+  const { w, mary, sarahId, tomId } = await photoWorld(t, { store: createStore(':memory:', { photos }) });
+  assert.equal(photos.size, 0);
+  assert.equal((await w.put(sarahId, mary.organizerToken)).status, 200);
+  assert.equal((await w.put(tomId, mary.organizerToken, GREY)).status, 200);
+  assert.equal(photos.size, 2);
+  assert.ok(photos.get(mary.home.id, sarahId).equals(KEPT.bytes));
+  assert.equal((await w.req(`/api/organize/visitors/${sarahId}`, { token: mary.organizerToken, method: 'DELETE' })).status, 200);
+  assert.equal(photos.size, 1);
+  assert.equal((await w.req('/api/organize/home', { token: mary.organizerToken, method: 'DELETE' })).status, 200);
+  assert.equal(photos.size, 0);
+});
+
+test('photos: at most 10 uploads a minute from one address', async (t) => {
+  const { w, mary, joe, sarahId, annId } = await photoWorld(t);
+  const statuses = [];
+  for (let i = 0; i < 12; i += 1) statuses.push((await w.put(sarahId, mary.organizerToken, i % 2 ? GREY : CANVAS)).status);
+  assert.deepEqual(statuses, [...Array(10).fill(200), 429, 429]);
+  // It is by address: another organizer there has to wait as well.
+  const waiting = await w.put(annId, joe.organizerToken);
+  assert.equal(waiting.status, 429);
+  assert.deepEqual(waiting.body, { error: 'Too many requests. Please wait a minute.' });
+  // Someone without a working link does not use up the organizer's tries, and reading is not limited.
+  const other = await photoWorld(t);
+  for (let i = 0; i < 15; i += 1) assert.equal((await other.w.put(other.sarahId, 'not-a-real-token')).status, 401);
+  assert.equal((await other.w.put(other.sarahId, other.mary.organizerToken)).status, 200);
+  for (let i = 0; i < 15; i += 1) assert.equal((await w.bytes(homePhoto(sarahId), { token: mary.homeToken })).status, 200);
+});
+
+test('photos: nothing about an upload or a request is logged, even when it goes wrong', async (t) => {
+  const written = [];
+  for (const method of ['log', 'info', 'warn', 'error', 'debug', 'trace']) t.mock.method(console, method, (...args) => written.push(args));
+  const { w, mary, sarahId } = await photoWorld(t);
+  assert.equal((await w.put(sarahId, mary.organizerToken)).status, 200);
+  assert.equal((await w.put(sarahId, mary.organizerToken, picture('sideways-320x240.jpg'))).status, 400);
+  assert.equal((await w.put(sarahId, mary.organizerToken, Buffer.concat([CANVAS, Buffer.alloc(250 * 1024)]))).status, 413);
+  assert.equal((await w.put(sarahId, mary.organizerToken, CANVAS, { type: 'image/png' })).status, 415);
+  assert.equal((await w.put(sarahId, mary.organizerToken, zlib.gzipSync(CANVAS), { headers: { 'Content-Encoding': 'gzip' } })).status, 415);
+  assert.equal((await w.put(sarahId, 'not-a-real-token')).status, 401);
+  assert.equal((await w.put('no-such-visitor', mary.organizerToken)).status, 404);
+  // JSON that is not JSON, sent to the photo route: answered plainly, not printed.
+  const broken = await w.put(sarahId, mary.organizerToken, '{"photo": ', { type: 'application/json' });
+  assert.deepEqual([broken.status, broken.body], [400, { error: REFUSED }]);
+  const tooMuchJson = await w.put(sarahId, mary.organizerToken, JSON.stringify({ photo: 'x'.repeat(20_000) }), { type: 'application/json' });
+  assert.deepEqual([tooMuchJson.status, tooMuchJson.body], [413, { error: 'That photo is too large. Please try another photo.' }]);
+  // The same route spelt as the server also accepts it: capitals, and a last "/".
+  for (const spelling of [organizePhoto(sarahId).toUpperCase().replace(sarahId.toUpperCase(), sarahId), `${organizePhoto(sarahId)}/`]) {
+    const big = await w.bytes(spelling, { method: 'PUT', token: mary.organizerToken, body: Buffer.concat([CANVAS, Buffer.alloc(250 * 1024)]) });
+    assert.deepEqual([big.status, big.body], [413, { error: 'That photo is too large. Please try another photo.' }], spelling);
+  }
+  assert.equal((await w.bytes(homePhoto(sarahId), { token: mary.homeToken })).status, 200);
+  assert.equal((await w.bytes(homePhoto(sarahId), { token: mary.homeToken, headers: { 'If-None-Match': `"${KEPT.etag}"` } })).status, 304);
+  assert.equal((await w.bytes(homePhoto(sarahId), { token: 'not-a-real-token' })).status, 401);
+  assert.equal((await w.bytes(homePhoto('no-such-visitor'), { token: mary.homeToken })).status, 404);
+  assert.equal((await w.bytes(organizePhoto(sarahId), { token: mary.organizerToken })).status, 200);
+  assert.equal((await w.bytes(organizePhoto(sarahId), { method: 'DELETE', token: mary.organizerToken })).status, 200);
+  await w.close();
+
+  // The disk fails as the picture is written: a plain answer, the old photo stays, nothing is printed.
+  let failing = false;
+  const inner = photosInMemory();
+  const photos = { ...inner, put: (...args) => { if (failing) throw new Error(`ENOSPC: no space left on device, write '/var/data/photos/${args[0]}/${args[1]}.jpg'`); inner.put(...args); } };
+  const second = await photoWorld(t, { store: createStore(':memory:', { photos }) });
+  assert.equal((await second.w.put(second.sarahId, second.mary.organizerToken)).status, 200);
+  failing = true;
+  const failed = await second.w.put(second.sarahId, second.mary.organizerToken, GREY);
+  assert.equal(failed.status, 500);
+  assert.deepEqual(failed.body, { error: 'The photo could not be saved. Please try again.' });
+  assert.equal(second.tagOf(second.mary), KEPT.etag);
+  assert.ok((await second.w.bytes(homePhoto(second.sarahId), { token: second.mary.homeToken })).bytes.equals(KEPT.bytes));
+  await second.w.close();
+  assert.deepEqual(written, []);
+});
+
+test('photos: these tests wrote nothing into the repository', () => {
+  assert.deepEqual(repositoryFiles(), repositoryBefore);
 });

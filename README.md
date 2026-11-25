@@ -30,6 +30,18 @@ On mobile data, some home routers and most workplaces, two devices cannot reach 
 - **When nothing works.** A visit that cannot connect within 30 seconds, or loses its connection and cannot get it back, ends by itself, and both sides are told in plain words.
 - **Checking it.** The organizer page says "Relay: ready" or "Relay: not set up", and its "Test the relay" button checks the key without a visit. During a visit the visitor's page says "Connected directly." or "Connected through the relay." in one small line. Adding `?relay=1` before the `#` of a visitor link (`/visit?relay=1#…`) sends that visit through the relay from the start. The home screen never shows any of this.
 
+### Photos of visitors
+
+The home screen can show a photo of each visitor in place of their initials: on the list of people, on the card that asks whether someone may visit, at the door when they knock, and beside “… is with you” during a visit. The name always stays in large letters beside it.
+
+- **Only the organizer adds, changes or removes a photo**, on the organizer page: “Add a photo”, then “Take a photo” or “Choose a photo”. The organizer already chooses each visitor’s name, so a photo gives nobody who holds a visitor link a new way to change how they appear, and no picture reaches the person at home that the family has not seen. Visitors cannot add one, and a visitor’s page is told nothing about photos.
+- **It shows straight away**, beside the name, with no extra question for the person at home. For someone newly invited it is on the card where they are asked whether that person may visit.
+- **Only a small copy leaves the organizer’s device.** The page turns the picture upright, cuts a square from its middle, shrinks it to 384 × 384 pixels and sends that as a JPEG (made again at a lower quality if it comes out over 150 KB). The picture that was picked is never sent, and a copy made this way holds no record of where or when the photo was taken. If the phone hands over a kind of picture the browser cannot read, the page says so and asks for another.
+- **The server checks it and writes it out again** (`lib/jpeg.js`). It accepts one plain JPEG: square, 96 to 512 pixels a side, upright, at most 200 KB. It then builds the file it keeps itself: a header of its own first, then only the picture’s own tables and data. Place, time and camera details (EXIF), colour profiles, comments and anything after the end of the picture are left out; a file with Adobe’s colour marker is refused. It reads the file’s structure and does not draw the picture, so one that is damaged inside can still get through: on the home screen it then shows as the initials or as a blank picture, with the name beside it as always.
+- **What is kept.** One small file for each visitor, in a `photos` folder beside the data file, and its tag in the data file. No earlier versions, and no location data. The file is deleted when the photo is removed, when the visitor is removed and when the home is deleted. Where the host takes snapshots of the disk, a deleted photo can remain in them until they run out: on Render, up to a week.
+- **Who can fetch one.** The organizer, and the home screen for its own visitors, each with their link’s secret. A photo is always sent as a JPEG picture and as a download, never as a page.
+- **Photo requests are not a record of visits.** The host can see which addresses are asked for and when. So the home screen fetches a photo once, when it first hears of it or when it changes, and keeps it in memory. It never asks for one because someone knocks or a visit starts or ends. (A fetch that fails is tried again after 1, 5 and 30 minutes, by the clock alone.) Uploads and photo requests are not logged by Be There.
+
 ### Links and privacy
 
 Each link carries a long random secret after the `#`, which browsers never send to servers. Only a SHA-256 hash of each secret is stored. Removing a visitor, or making a new home screen or organizer link, makes the old link stop working at once. Every page is `noindex` and sends no referrer.
@@ -61,9 +73,10 @@ The setup page (when it is done) and the organizer page (under "Links") carry fo
 ```
 npm install
 npm start            # http://localhost:3000, then open /setup
-npm test             # rules, storage, the relay, the new address and the server's visit flow
+npm test             # rules, storage, photos, the relay, the new address and the server's visit flow
 npm run e2e          # real visits between two Chromium browsers with fake cameras, directly and
-                     # through a relay on this machine, and pages moving to the new address
+                     # through a relay on this machine, a visitor's photo added, changed and
+                     # removed, and pages moving to the new address
                      # (needs Playwright; takes about a minute and a half)
 ```
 
@@ -75,7 +88,7 @@ Settings (environment variables):
 | --- | --- |
 | `PORT` | Port to listen on (default 3000). |
 | `SETUP_PASSWORD` | Required to create a home. Without it, anyone who can reach the server can create one, so always set it when deployed. |
-| `DATA_FILE` | Where the data file lives (default `data/db.json`). |
+| `DATA_FILE` | Where the data file lives (default `data/db.json`). Visitors’ photos are kept in a `photos` folder beside it. |
 | `ICE_SERVERS` | JSON list of public STUN servers to use in place of Cloudflare's. Anyone can read this list, so only STUN entries without a username or password are used; the relay never goes here. |
 | `TURN_KEY_ID` | The relay: the ID of a Cloudflare Realtime TURN key (32 letters and digits). |
 | `TURN_API_TOKEN` | The relay: that key's API token. A secret. |
@@ -92,6 +105,9 @@ Camera and microphone need HTTPS (or `localhost`).
 - **Trying the move to the new address for real.** It is tested in Chromium, with two names for one server on the developer's machine. It still needs a first check on an iPhone and an iPad: open a visitor link at the old address and see it arrive at the new one, then move the home screen with a new home screen link.
 - The organizer page does not know which address the tablet is at, so its note about moving the home screen stays up after the tablet has moved.
 - A visitor link that has stopped working (the visitor was removed) is taken along to the new address like any other. If that phone remembers a newer link there, the old one takes its place, and the newer link has to be opened once more from the message it came in.
-- **Hosting.** It needs HTTPS and storage that survives restarts (a persistent disk, or Postgres in place of the JSON file).
+- **Trying photos for real.** Photos are tested in Chromium with made-up pictures. They still need a first check on an iPhone and an iPad: “Take a photo” and “Choose a photo” on the organizer page (a photo from the library may arrive in a format the page has to turn into a JPEG, or cannot read), and the photo on the home screen’s list, at the door and during a visit.
+- A photo is cut from the middle of the picture. The organizer cannot yet move or zoom it; a picture with the face off to one side needs cropping first.
+- A visitor cannot offer their own photo, and the person at home is not asked before a photo the organizer adds is shown. Both were left out on purpose for now.
+- **Hosting.** It needs HTTPS and storage that survives restarts (a persistent disk, or Postgres in place of the JSON file; photos are files and need the disk either way).
 - **AI help:** live captions, translation, and visit reminders for family.
-- Photos of visitors in place of initials; a fuller kiosk setup guide for the tablet (today there are the four reminders under "Keeping the tablet ready"); a small robot visitors can drive around the home, later.
+- A fuller kiosk setup guide for the tablet (today there are the four reminders under "Keeping the tablet ready"); a small robot visitors can drive around the home, later.

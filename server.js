@@ -11,10 +11,11 @@ import { fileURLToPath } from 'node:url';
 import express from 'express';
 import { WebSocketServer } from 'ws';
 import { createStore } from './lib/store.js';
-import { visitStatus, visitorView, homeView, MODES, DROP_IN_NOTICE_SECONDS } from './lib/rules.js';
+import { visitStatus, visitorView, homeView, photoTag, MODES, DROP_IN_NOTICE_SECONDS } from './lib/rules.js';
 import { sameHash, hashToken } from './lib/tokens.js';
 import { publicIceServers, createRelay } from './lib/ice.js';
 import { CANONICAL_ALLOW, canonicalOriginFrom } from './lib/address.js';
+import { acceptPhoto, PHOTO_LIMITS } from './lib/jpeg.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const RING_SECONDS = 45;
@@ -31,6 +32,15 @@ function endReason(reason, call) {
 }
 
 const bearer = (req) => (/^Bearer\s+(\S+)$/i.exec(req.get('authorization') || '') || [])[1] || '';
+
+// The photo routes, as the server matches them (capital letters and a last
+// "/" count for nothing). Nothing about them is ever logged: see the end of
+// the routes.
+const PHOTO_ROUTE = /^\/api\/(organize|home)\/visitors\/[^/]+\/photo\/?$/i;
+// Does an If-None-Match header name this tag? ("*", or a list of quoted tags.)
+function namesTag(header, tag) {
+  return String(header || '').split(',').map((part) => part.trim().replace(/^W\//, '')).some((part) => part === '*' || part === `"${tag}"`);
+}
 
 // A few requests per minute per address, for the routes that create things.
 function rateLimit(perMinute) {
@@ -173,6 +183,71 @@ export function createApp({
     res.json({ ok: true });
   });
 
+  // ----- Photos of visitors -----
+  // Only the organizer adds, changes or removes a photo. They already choose
+  // each visitor's name, so this gives a link holder no new way to change how
+  // they appear, and no picture reaches the person at home that the family
+  // has not seen. A new photo shows on the home screen straight away. The
+  // home screen may read the photos of its own visitors and nobody else's.
+  // A visitor's page is told nothing about photos, not even its own.
+  // The picture is checked and rebuilt before it is kept (lib/jpeg.js).
+  const theirVisitor = (req, res, next) => {
+    const visitor = req.home.visitors.find((v) => v.id === req.params.id && !v.removed);
+    if (!visitor) return res.status(404).json({ error: 'No such visitor.' });
+    req.visitor = visitor;
+    next();
+  };
+  // Read as bytes on this route only, only when sent as image/jpeg, never
+  // unpacked from a compressed body, and never more than a photo may be.
+  const jpegBody = express.raw({ type: 'image/jpeg', limit: PHOTO_LIMITS.maxBytes, inflate: false });
+  app.put('/api/organize/visitors/:id/photo', organizer, rateLimit(10), theirVisitor, jpegBody, (req, res) => {
+    // Nothing read the body: it was not sent as image/jpeg.
+    if (!Buffer.isBuffer(req.body)) return res.status(415).json({ error: 'A photo must be sent as a JPEG picture.' });
+    const photo = acceptPhoto(req.body);
+    if (!photo.ok) return res.status(400).json({ error: 'That picture couldn’t be used. Please try another photo.', reason: photo.reason });
+    store.setPhoto(req.home, req.visitor.id, photo.bytes, photo.etag);
+    changed(req.home);
+    res.json({ photo: photo.etag });
+  });
+  app.delete('/api/organize/visitors/:id/photo', organizer, theirVisitor, (req, res) => {
+    const had = !!req.visitor.photo;
+    store.removePhoto(req.home, req.visitor.id);
+    if (had) changed(req.home);
+    res.json({ ok: true });
+  });
+  app.get('/api/organize/visitors/:id/photo', organizer, theirVisitor, (req, res) => sendPhoto(req, res, req.home, req.visitor));
+  // The home screen shows who it is with its own link's secret, and is given
+  // only the photos of that home's visitors: anyone else's is "not found".
+  app.get('/api/home/visitors/:id/photo', (req, res) => {
+    const home = store.homeByHomeToken(bearer(req));
+    if (!home) return res.status(401).json({ error: 'This home screen link does not work. Ask your family for a new one.' });
+    sendPhoto(req, res, home, home.visitors.find((v) => v.id === req.params.id && !v.removed));
+  });
+
+  // A photo is always sent as a JPEG picture and as a download, whatever was
+  // uploaded: opened by itself it is saved, never shown as a page, and no
+  // browser will run it. Pages fetch it with their link's secret and show
+  // the bytes themselves. Only this browser may keep it, and it asks again
+  // each time; the tag tells it when nothing has changed.
+  function sendPhoto(req, res, home, visitor) {
+    const tag = photoTag(visitor);
+    const none = () => res.status(404).json({ error: 'No photo.' });
+    if (!tag) return none();
+    const always = { 'Cache-Control': 'private, no-cache', Vary: 'Authorization', ETag: `"${tag}"` };
+    if (namesTag(req.get('if-none-match'), tag)) return res.status(304).set(always).end();
+    const bytes = store.photoBytes(home, visitor.id);
+    if (!bytes) return none();
+    res.set({
+      ...always,
+      'Content-Type': 'image/jpeg',
+      'X-Content-Type-Options': 'nosniff',
+      'Content-Disposition': 'attachment; filename="photo.jpg"',
+      'Content-Security-Policy': "default-src 'none'; sandbox",
+      'Cross-Origin-Resource-Policy': 'same-origin',
+    });
+    res.end(bytes);
+  }
+
   // ----- Visitors -----
   app.get('/api/visit', (req, res) => {
     const found = store.visitorByToken(bearer(req));
@@ -190,6 +265,17 @@ export function createApp({
     app.get(`/${page}`, (req, res) => res.sendFile(path.join(pub, `${page}.html`), { cacheControl: false, headers: { 'Cache-Control': 'no-cache' } }));
   }
   app.use(express.static(pub, { extensions: ['html'], maxAge: '5m', etag: true, setHeaders: checkEveryTime }));
+
+  // Photo uploads and requests are never logged, not even when one goes
+  // wrong. Left alone, Express would print the error; here it is answered in
+  // plain words and nothing is written anywhere.
+  app.use((err, req, res, next) => {
+    if (!PHOTO_ROUTE.test(req.path) || res.headersSent) return next(err);
+    if (err?.type === 'entity.too.large') return res.status(413).json({ error: 'That photo is too large. Please try another photo.' });
+    if (err?.type === 'encoding.unsupported') return res.status(415).json({ error: 'A photo must be sent as a JPEG picture.' });
+    const refused = err?.status >= 400 && err.status < 500;
+    res.status(refused ? err.status : 500).json({ error: refused ? 'That picture couldn’t be used. Please try another photo.' : 'The photo could not be saved. Please try again.' });
+  });
 
   // ----- Live state: who is connected, who is visiting -----
   // homeId -> { homeSocket, visitors: Map<visitorId, Set<ws>>, call }

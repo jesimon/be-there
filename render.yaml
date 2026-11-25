@@ -1,5 +1,6 @@
 # Render Blueprint for Be There: one web service with a small persistent disk
-# for its data file. Pushing to main deploys automatically.
+# for its data file and visitors' photos (a "photos" folder beside the data
+# file). Pushing to main deploys automatically.
 services:
   - type: web
     name: be-there

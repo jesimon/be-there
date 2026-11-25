@@ -27,21 +27,30 @@ Be There is a Gladspring venture (founders: Jeremy and Suzanne Simon; private): 
 - Never move the home screen automatically: `home.js` must not load `moved.js` (a test checks). A camera prompt at a new address must not land on the person at home unannounced. It moves only when a family member opens a new home screen link (which the organizer page makes at the new address) on the tablet.
 - Links made on the organizer and setup pages use `canonicalOrigin || location.origin`.
 
+## Photos of visitors (never weaken this either)
+- Only the organizer adds, changes or removes a visitor's photo (`PUT`/`DELETE /api/organize/visitors/:id/photo`). Visitors cannot upload, there is no photo route for a visitor's link, and `visitorView()` and every message to a visitor's page say nothing about photos. A photo the organizer adds shows on the home screen straight away; the name always stays in large text beside it.
+- The server trusts no upload. `lib/jpeg.js` (pure, tested) checks the JPEG's structure and rebuilds it strictly: a fixed JFIF header of our own first (never bytes from the upload), then only tables, frame and scans; EXIF, ICC profiles, comments, every other APPn segment and anything after the end marker are dropped; a file with an Adobe APP14 marker is refused; at most 4 tables in a quantization segment; every table or part a frame or scan names must have been given. Accepted: 8-bit, 1 or 3 components, baseline/extended/progressive, square, 96 to 512 px, EXIF orientation absent or 1, at most 16 scans, at most 200 KB. No image library; the organizer's browser makes the 384 px square (`squarePhoto()` in `public/js/photo.js`), and the original file is never uploaded.
+- A photo is fetched once for each version and never because of a visit. `homeView()` gives each visitor's `photo` tag; the home screen calls `getPhotoUrl()` only when a `state` message arrives, which asks the server only for a tag it has not seen, and keeps the picture in memory (`cache: 'no-store'`, so the browser makes no checking requests of its own). The knock screen and the in-visit label use `cachedPhotoUrl()`, which never asks. A failed fetch is retried by timer only (`RETRY_AFTER`). The host can log request paths, so a photo request at the moment of a knock would be a log of visits.
+- Photo responses always carry `Content-Type: image/jpeg`, `nosniff`, `Content-Disposition: attachment`, `Content-Security-Policy: default-src 'none'; sandbox`, `Cross-Origin-Resource-Policy: same-origin`, `Cache-Control: private, no-cache` and `Vary: Authorization`. The home screen reads only its own visitors' photos, with its link secret as a Bearer token.
+- Uploads and photo requests are never logged, errors included (the handler after the routes in `server.js` answers them itself, because Express would print them).
+- One file per visitor, no history: `photos/<home id>/<visitor id>.jpg` beside `DATA_FILE` (`lib/photos.js`; in memory for a `':memory:'` store, so tests never write into the repository). `store.removeVisitor()` and `store.deleteHome()` delete the files; the visitor's record holds only `photo: { etag, updatedAt }`.
+
 ## Architecture
 - No build step. Node 20+, Express 5, `ws`, ES modules. `node-turn` is a devDependency used only by `test/e2e.mjs`.
 - `server.js`: HTTP API, pages, and the WebSocket switchboard at `/ws` (`hello` → `knock`/`answer`/`decline`/`end`/`signal`/`relay`/`pause`/`approve`/`mode`). Media is peer-to-peer WebRTC; the visitor makes the offer, after the home screen has answered.
 - `lib/ice.js`: the public STUN list, the relay's settings, and minting and revoking relay credentials (fetch and the environment are passed in; nothing is logged).
 - `lib/address.js`: the one address devices may be sent on to, and the check of `CANONICAL_ORIGIN` against it.
-- `lib/store.js`: one JSON file (`DATA_FILE`), atomic writes. Only SHA-256 hashes of link secrets are stored.
-- `public/`: plain HTML/CSS/JS, one script per page (`home`, `visit`, `organize`, `setup`) plus `js/common.js`, `js/peer.js` and `js/moved.js` (the move to the new address; not used by `home`). Large type and buttons on the home screen; keep it usable by someone with poor sight or hearing.
+- `lib/store.js`: one JSON file (`DATA_FILE`), atomic writes. Only SHA-256 hashes of link secrets are stored. It also looks after visitors' photos through a keeper from `lib/photos.js` (`createStore(file, { photos })`).
+- `lib/jpeg.js`: `inspectJpeg`, `rebuildJpeg` and `acceptPhoto` for visitors' photos. `lib/photos.js`: where the files are kept (`photosInFolder`, `photosInMemory`).
+- `public/`: plain HTML/CSS/JS, one script per page (`home`, `visit`, `organize`, `setup`) plus `js/common.js`, `js/peer.js`, `js/moved.js` (the move to the new address; not used by `home`) and `js/photo.js` (making, fetching and showing photos; used by `home` and `organize`, never by `visit`; it imports nothing). Large type and buttons on the home screen; keep it usable by someone with poor sight or hearing.
 - `public/js/peer.js`: the video link for one visit and its timeline (`TIMES`: ask for the relay after 5 s, give up after 30 s, try again after a drop). It takes its timers and `RTCPeerConnection` as arguments so `test/peer.test.js` can run it without a browser.
 - Link secrets go after `#` so they never reach server logs.
 - The home screen stays open for days, so an old page talks to a new server after every deploy. Keep every existing WebSocket message, HTTP route and `common.js` export working (`makePeer` is kept for this); add, never rename. Pages, scripts and styles are served with `Cache-Control: no-cache`.
 
 ## Commands
 - `npm start` / `npm run dev`
-- `npm test` (unit + server flow + the relay timeline + the new address; the relay is always a fake, nothing calls Cloudflare)
-- `npm run e2e` (two real Chromium browsers with fake cameras, directly and through a local relay, then pages moving between two names for one local server; about a minute and a half; `SHOTS=dir` saves screenshots)
+- `npm test` (unit + server flow + the relay timeline + the new address + photos; the relay is always a fake, nothing calls Cloudflare, and nothing is written into the repository)
+- `npm run e2e` (two real Chromium browsers with fake cameras, directly and through a local relay, a photo added, changed and removed with every photo request of the home screen counted, then pages moving between two names for one local server; about a minute and a half; `SHOTS=dir` saves screenshots)
 
 Every change to the rules or the visit flow needs a test.
 
