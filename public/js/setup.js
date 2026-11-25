@@ -1,4 +1,11 @@
 import { $, api, copyText } from './common.js';
+import { goToNewAddress, newAddress } from './moved.js';
+
+// If Be There has a new address, the home is set up there: this page goes
+// there by itself, and then `linksAt` never arrives and nothing is created
+// here. If the page stays, its two links still point at the new address once
+// there is one.
+const linksAt = goToNewAddress('setup').then(newAddress).then((there) => there || location.origin);
 
 const info = await api('/api/setup-info').catch(() => ({ needsPassword: false }));
 if (info.needsPassword) {
@@ -11,6 +18,7 @@ $('#form').addEventListener('submit', async (e) => {
   const f = new FormData(e.target);
   $('#error').textContent = '';
   try {
+    const linkBase = await linksAt;
     const res = await api('/api/homes', {
       method: 'POST',
       body: {
@@ -22,8 +30,8 @@ $('#form').addEventListener('submit', async (e) => {
         password: f.get('password') || '',
       },
     });
-    const homeLink = `${location.origin}/home#${res.homeToken}`;
-    const orgLink = `${location.origin}/organize#${res.organizerToken}`;
+    const homeLink = `${linkBase}/home#${res.homeToken}`;
+    const orgLink = `${linkBase}/organize#${res.organizerToken}`;
     $('#home-link').textContent = homeLink;
     $('#org-link').textContent = orgLink;
     $('#org-open').href = orgLink;

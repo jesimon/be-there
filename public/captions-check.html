@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="robots" content="noindex, nofollow">
+  <title>Try captions · Be There</title>
+  <link rel="stylesheet" href="/css/style.css">
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+</head>
+<body class="check-page">
+  <main class="page narrow">
+    <p class="brand">Be There</p>
+    <h1>Try captions on this device</h1>
+    <p class="big">During a visit, captions show in large letters what the visitor says. They are worked out on the device itself: no sound and no words leave it. They are a trial, in English only, and they make mistakes.</p>
+    <p>This page finds out whether this device is quick enough. Do it on the tablet that sits in their home, in the same browser and at the same address as its home screen. It also fetches what captions need, so the first visit does not have to wait for that.</p>
+    <p id="problem" class="error" role="alert" hidden></p>
+
+    <section class="card">
+      <h2>1. Get ready</h2>
+      <p>Fetches the speech model (about 49 MB the first time) and starts it.</p>
+      <button id="step1" class="btn yes big-btn" type="button" disabled>Get ready</button>
+      <p id="result1" class="check-result" role="status"></p>
+    </section>
+
+    <section class="card">
+      <h2>2. Quick test</h2>
+      <p>Writes down eleven seconds of clear speech, and times it.</p>
+      <button id="step2" class="btn yes big-btn" type="button" disabled>Quick test</button>
+      <p id="result2" class="check-result" role="status"></p>
+    </section>
+
+    <section class="card">
+      <h2 id="step3-title">3. Two-minute test</h2>
+      <p>Plays that speech over and over, as if a visitor were talking, and shows captions for it just as a visit would. You will hear it. Keep this page open until it has finished.</p>
+      <button id="step3" class="btn yes big-btn" type="button" disabled>Two-minute test</button>
+      <div id="captions" class="captions" hidden></div>
+      <p id="result3" class="check-result" role="status"></p>
+      <audio id="loop" autoplay playsinline></audio>
+    </section>
+
+    <section class="card">
+      <h2>The answer</h2>
+      <p id="verdict" class="check-verdict">Not tried yet.</p>
+      <pre id="numbers" class="check-numbers"></pre>
+      <p class="muted small">If you are asked how it went, read these lines back.</p>
+    </section>
+    <p class="muted small">Captions are made with software and a speech model that others have shared freely. <a href="/third-party">Whose work it is</a>.</p>
+  </main>
+  <script type="module" src="/js/captions-check.js"></script>
+</body>
+</html>

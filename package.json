@@ -10,10 +10,14 @@
     "start": "node server.js",
     "dev": "node --watch server.js",
     "test": "node --test test/*.test.js",
-    "e2e": "node test/e2e.mjs"
+    "e2e": "node test/e2e.mjs",
+    "captions:fetch": "node scripts/fetch-captions-files.mjs"
   },
   "dependencies": {
     "express": "^5.1.0",
     "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "node-turn": "0.0.6"
   }
 }

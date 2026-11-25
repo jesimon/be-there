@@ -1,5 +1,11 @@
 # Render Blueprint for Be There: one web service with a small persistent disk
-# for its data file. Pushing to main deploys automatically.
+# for its data file, visitors' photos (a "photos" folder beside the data
+# file) and the files live captions need (a "captions" folder beside it too:
+# about 51 MB, fetched by the server once and kept across deploys). Pushing
+# to main deploys automatically.
+#
+# Captions are a trial and are on unless CAPTIONS is set to "off" on the
+# service's Environment page.
 services:
   - type: web
     name: be-there
@@ -29,3 +35,12 @@ services:
       # service's Environment page.
       - key: SETUP_PASSWORD
         generateValue: true
+      # Be There's new address. With this set, visitor, organizer and setup
+      # pages opened at the onrender.com address go on to it by themselves, and
+      # new links point at it. The home screen never moves by itself. Only the
+      # address built into lib/address.js is accepted; anything else is
+      # ignored. To stop devices moving, remove this line and also delete the
+      # variable on the service's Environment page (a sync may leave it there).
+      # Both addresses keep working either way.
+      - key: CANONICAL_ORIGIN
+        value: https://bethere.gladspring.org

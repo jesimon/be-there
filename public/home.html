@@ -30,6 +30,7 @@
     <section class="status-row">
       <p id="status" class="status-pill">Connecting…</p>
       <button id="pause" class="btn big-btn" type="button">Pause visits</button>
+      <p id="note" class="home-note" role="status" hidden></p>
     </section>
 
     <section>
@@ -56,8 +57,15 @@
   <div id="call" class="call" hidden>
     <video id="remote" autoplay playsinline></video>
     <video id="local" autoplay playsinline muted></video>
-    <p id="with-you" class="with-you"><span class="live-dot" aria-hidden="true"></span><span id="with-you-text"></span></p>
-    <button id="end" class="btn no huge-btn end" type="button">End visit</button>
+    <p id="with-you" class="with-you"><span class="live-dot" aria-hidden="true"></span><span id="with-you-photo" class="avatar"></span><span id="with-you-text"></span></p>
+    <!-- Captions (a trial): what the visitor says, in large letters, worked
+         out on this tablet. Shown only when the person at home switches them
+         on, and only where the tablet can do it. -->
+    <div id="captions" class="captions" hidden></div>
+    <div class="call-bar">
+      <button id="captions-toggle" class="btn huge-btn captions-toggle" type="button" aria-pressed="false" hidden>Captions off</button>
+      <button id="end" class="btn no huge-btn end" type="button">End visit</button>
+    </div>
   </div>
 
   <script type="module" src="/js/home.js"></script>
