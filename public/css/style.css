@@ -121,6 +121,8 @@ legend { font-weight: 600; padding: 0 6px; }
 .clock { font-size: clamp(3rem, 8vw, 5.5rem); font-weight: 700; margin: 0; line-height: 1; font-variant-numeric: tabular-nums; }
 .status-row { display: flex; align-items: center; gap: 18px; flex-wrap: wrap; margin: 28px 0; }
 .status-row .status-pill { font-size: 1.4rem; padding: 0.4em 1em; }
+/* A few calm words under the status, e.g. when a visit could not connect. */
+.home-note { flex-basis: 100%; margin: 0; font-size: 1.4rem; font-weight: 600; }
 .section-title { font-size: 1.6rem; }
 .people { display: grid; grid-template-columns: repeat(auto-fill, minmax(340px, 1fr)); gap: 16px; }
 @media (max-width: 400px) { .people { grid-template-columns: 1fr; } }
@@ -164,9 +166,20 @@ legend { font-weight: 600; padding: 0 6px; }
 @keyframes pulse { 50% { box-shadow: 0 0 0 10px rgba(255, 59, 48, 0); } }
 @media (prefers-reduced-motion: reduce) { .live-dot { animation: none; } }
 .call .end { position: absolute; left: 50%; bottom: 20px; transform: translateX(-50%); }
+/* The visitor's side only: one small line, under the name, saying how the two
+   devices are connected. */
+.path-line {
+  position: absolute; top: calc(24px + 2.3 * clamp(1.2rem, 3vw, 1.8rem)); left: 50%; transform: translateX(-50%);
+  margin: 0; width: max-content; max-width: calc(100% - 32px); text-align: center;
+  background: rgba(0, 0, 0, 0.55); color: #e4e4e4; padding: 0.2em 0.9em; border-radius: 14px;
+  font-size: 0.9rem;
+}
+.path-line:empty { display: none; }
 
 .preview { width: 100%; max-width: 360px; border-radius: var(--radius); background: #000; transform: scaleX(-1); display: block; margin: 16px auto; }
 .visit-screen .page { text-align: center; }
 .knock .big { font-size: clamp(1.4rem, 3vw, 2rem); }
 
 .link-actions { display: flex; flex-wrap: wrap; gap: 10px; }
+#relay-state { font-weight: 600; }
+.relay-result { font-weight: 600; min-height: 1.5em; margin: 0.6em 0 0; }

@@ -15,5 +15,8 @@
   "dependencies": {
     "express": "^5.1.0",
     "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "node-turn": "0.0.6"
   }
 }

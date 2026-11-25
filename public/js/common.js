@@ -1,5 +1,7 @@
 // Shared by every page: the secret link, the live connection to the server,
-// the video connection between the two devices, and a gentle chime.
+// and a gentle chime. The video connection between the two devices is in
+// peer.js; makePeer below is the earlier version, kept because a browser can
+// still pair an older, cached page script with this file.
 
 // Each link carries its secret after the #, which browsers never send to servers.
 export function tokenFromLink() {
@@ -57,7 +59,7 @@ export async function api(pathname, { token, method = 'GET', body } = {}) {
 
 let configPromise;
 export function getConfig() {
-  configPromise ||= api('/api/config').catch(() => ({ iceServers: [{ urls: 'stun:stun.l.google.com:19302' }], dropInNoticeSeconds: 8 }));
+  configPromise ||= api('/api/config').catch(() => ({ iceServers: [{ urls: 'stun:stun.cloudflare.com:3478' }], dropInNoticeSeconds: 8 }));
   return configPromise;
 }
 

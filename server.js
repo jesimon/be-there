@@ -1,8 +1,10 @@
 // Be There: the web server and the live "who is visiting" switchboard.
 //
-// Video and sound go straight between the two devices (WebRTC); this server
-// only introduces them and enforces the rules in lib/rules.js. It never sees,
-// records or stores a visit.
+// Video and sound go straight between the two devices when their networks
+// allow it, and otherwise through Cloudflare's relay, encrypted from one device
+// to the other (lib/ice.js). They never pass through this server: it only
+// introduces the two devices and enforces the rules in lib/rules.js. It never
+// sees, records or stores a visit.
 import http from 'node:http';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -11,17 +13,16 @@ import { WebSocketServer } from 'ws';
 import { createStore } from './lib/store.js';
 import { visitStatus, visitorView, homeView, MODES, DROP_IN_NOTICE_SECONDS } from './lib/rules.js';
 import { sameHash, hashToken } from './lib/tokens.js';
+import { publicIceServers, createRelay } from './lib/ice.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const RING_SECONDS = 45;
-
-function iceServers() {
-  try {
-    const list = JSON.parse(process.env.ICE_SERVERS || 'null');
-    if (Array.isArray(list) && list.length) return list;
-  } catch { /* fall through to the default */ }
-  return [{ urls: 'stun:stun.l.google.com:19302' }];
-}
+// Relay credentials are made at most this many times in one visit: once when
+// it is first needed, then again only if a very long visit outlasts them.
+const MAX_RELAY_MINTS = 4;
+// Why a device may say a visit ended. Anything else is passed on as 'ended'.
+const END_REASONS = ['ended', 'no_connection'];
+const endReason = (reason) => (END_REASONS.includes(reason) ? reason : 'ended');
 
 const bearer = (req) => (/^Bearer\s+(\S+)$/i.exec(req.get('authorization') || '') || [])[1] || '';
 
@@ -40,7 +41,13 @@ function rateLimit(perMinute) {
   };
 }
 
-export function createApp({ store = createStore(), setupPassword = (process.env.SETUP_PASSWORD || '').trim() } = {}) {
+export function createApp({
+  store = createStore(),
+  setupPassword = (process.env.SETUP_PASSWORD || '').trim(),
+  env = process.env,
+  relay = createRelay({ env }),
+  now = Date.now,
+} = {}) {
   const app = express();
   app.set('trust proxy', 1);
   app.disable('x-powered-by');
@@ -61,7 +68,10 @@ export function createApp({ store = createStore(), setupPassword = (process.env.
   });
 
   app.get('/healthz', (req, res) => res.json({ ok: true }));
-  app.get('/api/config', (req, res) => res.json({ iceServers: iceServers(), dropInNoticeSeconds: DROP_IN_NOTICE_SECONDS }));
+  // Anyone can read this, so it only ever lists public STUN servers. Relay
+  // credentials go to the two devices of a live visit, over their own
+  // connections, and nowhere else.
+  app.get('/api/config', (req, res) => res.json({ iceServers: publicIceServers(env), dropInNoticeSeconds: DROP_IN_NOTICE_SECONDS }));
 
   // ----- Setting up a home (needs SETUP_PASSWORD when it is set) -----
   app.post('/api/homes', rateLimit(5), (req, res) => {
@@ -86,7 +96,16 @@ export function createApp({ store = createStore(), setupPassword = (process.env.
     req.home = home;
     next();
   };
-  app.get('/api/organize', organizer, (req, res) => res.json({ home: homeView(req.home), online: live(req.home.id).online }));
+  app.get('/api/organize', organizer, (req, res) => res.json({ home: homeView(req.home), online: live(req.home.id).online, relay: relay.ready ? 'ready' : 'off' }));
+  // Lets the organizer check the relay key without a visit: make credentials
+  // that last a minute, and make them stop working straight away.
+  app.post('/api/organize/relay-test', organizer, rateLimit(6), async (req, res) => {
+    if (!relay.ready) return res.json({ ok: false, reason: 'not_set_up' });
+    const made = await Promise.resolve().then(() => relay.mint({ ttl: 60 })).catch(() => null);
+    if (!made?.ok) return res.json({ ok: false, reason: made?.reason || 'network' });
+    await revoke(made.username);
+    res.json({ ok: true });
+  });
   app.patch('/api/organize/home', organizer, (req, res) => {
     const { name, personName, hours, timeZone } = req.body || {};
     const changes = Object.fromEntries(Object.entries({ name, personName, hours, timeZone }).filter(([, v]) => v !== undefined));
@@ -117,6 +136,8 @@ export function createApp({ store = createStore(), setupPassword = (process.env.
   });
   app.post('/api/organize/organizer-link', organizer, (req, res) => res.json({ organizerToken: store.resetOrganizerLink(req.home) }));
   app.delete('/api/organize/home', organizer, (req, res) => {
+    // End any visit first, so its relay credentials stop working too.
+    endCallIf(req.home.id, () => true, 'ended');
     const l = live(req.home.id);
     if (l.homeSocket) l.homeSocket.close(4002, 'home deleted');
     for (const set of l.visitors.values()) for (const ws of set) ws.close(4002, 'home deleted');
@@ -133,11 +154,15 @@ export function createApp({ store = createStore(), setupPassword = (process.env.
   });
 
   // ----- Pages -----
+  // Pages, scripts and styles are checked with the server every time they are
+  // loaded (the ETag keeps that cheap), so a page never runs with one new
+  // script and one old one after an update.
   const pub = path.join(here, 'public');
+  const checkEveryTime = (res, file) => { if (/\.(html|js|css)$/.test(file)) res.setHeader('Cache-Control', 'no-cache'); };
   for (const page of ['home', 'visit', 'organize', 'setup']) {
-    app.get(`/${page}`, (req, res) => res.sendFile(path.join(pub, `${page}.html`)));
+    app.get(`/${page}`, (req, res) => res.sendFile(path.join(pub, `${page}.html`), { cacheControl: false, headers: { 'Cache-Control': 'no-cache' } }));
   }
-  app.use(express.static(pub, { extensions: ['html'], maxAge: '5m' }));
+  app.use(express.static(pub, { extensions: ['html'], maxAge: '5m', etag: true, setHeaders: checkEveryTime }));
 
   // ----- Live state: who is connected, who is visiting -----
   // homeId -> { homeSocket, visitors: Map<visitorId, Set<ws>>, call }
@@ -172,12 +197,89 @@ export function createApp({ store = createStore(), setupPassword = (process.env.
     }
   }
 
+  // ----- The relay, for visits that cannot connect directly -----
+  // Credentials are made only for a live visit, only when one of its two
+  // devices asks (they ask when a direct connection has not come up), are
+  // given only to those two devices, and stop working when the visit ends.
+  // Nothing about them is logged or stored: they live on the call, in memory.
+  const background = new Set();     // requests to the relay service still under way
+  const track = (promise) => {
+    background.add(promise);
+    promise.finally(() => background.delete(promise));
+    return promise;
+  };
+  // Makes credentials stop working. Best effort, and never throws.
+  const revoke = (username) => track(Promise.resolve().then(() => relay.revoke(username)).catch(() => {}));
+
+  function releaseRelay(call) {
+    if (!call.relay) return;
+    for (const username of call.relay.usernames.splice(0)) revoke(username);
+    call.relay.iceServers = null;
+  }
+
+  // `ws` is one of the two devices of `call`, which is live.
+  function onRelayRequest(ws, homeId, call) {
+    if (!relay.ready) return send(ws, { type: 'relay', iceServers: null, reason: 'not_set_up' });
+    const unavailable = { type: 'relay', iceServers: null, reason: 'unavailable' };
+    call.relay ||= { usernames: [], iceServers: null, mintedAt: 0, ttl: 0, mints: 0, waiting: null };
+    const r = call.relay;
+    // Credentials in the first half of their life are simply given again.
+    if (r.iceServers && now() - r.mintedAt < r.ttl * 500) return send(ws, { type: 'relay', iceServers: r.iceServers, ttl: r.ttl });
+    // One request to the relay service at a time: whoever asks meanwhile
+    // shares its answer.
+    if (r.waiting) {
+      r.waiting.add(ws);
+      return;
+    }
+    if (r.mints >= MAX_RELAY_MINTS) return send(ws, unavailable);
+    r.mints += 1;
+    r.waiting = new Set([ws]);
+    track(Promise.resolve().then(() => relay.mint()).catch(() => null).then((made) => {
+      const askers = r.waiting;
+      r.waiting = null;
+      const ok = !!made?.ok && Array.isArray(made.iceServers) && typeof made.username === 'string';
+      // The visit ended while we were asking: these must not outlive it.
+      if (lives.get(homeId)?.call !== call) {
+        if (ok) revoke(made.username);
+        return;
+      }
+      if (!ok) {
+        for (const asker of askers) send(asker, unavailable);
+        return;
+      }
+      r.usernames.push(made.username);
+      r.iceServers = made.iceServers;
+      r.mintedAt = now();
+      r.ttl = Number(relay.ttl) || 0;
+      // The home screen first: the visitor makes a new offer as soon as it
+      // has the servers, and the home screen must hold them to answer it.
+      const msg = { type: 'relay', iceServers: r.iceServers, ttl: r.ttl };
+      send(lives.get(homeId).homeSocket, msg);
+      send(call.socket, msg);
+    }).catch(() => {}));
+  }
+
+  // When the server stops: end every visit, and wait until the relay service
+  // has been told that their credentials no longer work. Each request to it
+  // gives up by itself after a few seconds; the limit here is a backstop.
+  async function shutdown() {
+    for (const homeId of [...lives.keys()]) endCallIf(homeId, () => true, 'offline');
+    let timer;
+    const tooLong = new Promise((resolve) => { timer = setTimeout(resolve, 6000); });
+    const told = (async () => { while (background.size) await Promise.allSettled([...background]); })();
+    await Promise.race([told, tooLong]);
+    clearTimeout(timer);
+  }
+
+  // Every way a visit can end comes through here, so this is also where its
+  // relay credentials stop working.
   function endCallIf(homeId, test, reason = 'ended') {
     const l = live(homeId);
     const call = l.call;
     if (!call || !test(call)) return false;
     clearTimeout(call.timer);
     l.call = null;
+    releaseRelay(call);
     send(l.homeSocket, { type: 'ended', visitorId: call.visitorId, reason });
     send(call.socket, { type: 'ended', reason });
     const home = store.getHome(homeId);
@@ -217,9 +319,12 @@ export function createApp({ store = createStore(), setupPassword = (process.env.
       case 'decline':
         return endCallIf(home.id, (c) => c.visitorId === msg.visitorId && c.state === 'ringing', 'declined');
       case 'end':
-        return endCallIf(home.id, () => true, 'ended');
+        return endCallIf(home.id, () => true, endReason(msg.reason));
       case 'signal':
         if (l.call?.state === 'live') send(l.call.socket, { type: 'signal', data: msg.data });
+        return;
+      case 'relay':
+        if (l.call?.state === 'live') onRelayRequest(ws, home.id, l.call);
         return;
       default:
     }
@@ -243,10 +348,14 @@ export function createApp({ store = createStore(), setupPassword = (process.env.
       }
       case 'cancel':
       case 'end':
-        endCallIf(home.id, (c) => c.socket === ws, msg.type === 'cancel' ? 'cancelled' : 'ended');
+        endCallIf(home.id, (c) => c.socket === ws, msg.type === 'cancel' ? 'cancelled' : endReason(msg.reason));
         return;
       case 'signal':
         if (l.call?.socket === ws && l.call.state === 'live') send(l.homeSocket, { type: 'signal', data: msg.data });
+        return;
+      case 'relay':
+        // Only the visitor who is in the visit, and only once it is answered.
+        if (l.call?.socket === ws && l.call.state === 'live') onRelayRequest(ws, home.id, l.call);
         return;
       default:
     }
@@ -323,11 +432,11 @@ export function createApp({ store = createStore(), setupPassword = (process.env.
     });
   }
 
-  return { app, onConnection };
+  return { app, onConnection, shutdown, relayReady: !!relay.ready };
 }
 
 export function startServer({ port = Number(process.env.PORT) || 3000, ...options } = {}) {
-  const { app, onConnection } = createApp(options);
+  const { app, onConnection, shutdown, relayReady } = createApp(options);
   const server = http.createServer(app);
   const wss = new WebSocketServer({ server, path: '/ws', maxPayload: 64 * 1024 });
   wss.on('connection', onConnection);
@@ -345,13 +454,27 @@ export function startServer({ port = Number(process.env.PORT) || 3000, ...option
       resolve({
         server,
         url: `http://localhost:${actual}`,
-        close: () => new Promise((done) => { clearInterval(beat); for (const ws of wss.clients) ws.terminate(); wss.close(); server.close(done); }),
+        relayReady,
+        close: async () => {
+          clearInterval(beat);
+          await shutdown();
+          for (const ws of wss.clients) ws.terminate();
+          wss.close();
+          await new Promise((done) => server.close(done));
+        },
       });
     });
   });
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
-  const { url } = await startServer();
+  const { url, relayReady, close } = await startServer();
   console.log(`Be There on ${url}${process.env.SETUP_PASSWORD ? '' : ' (no SETUP_PASSWORD: anyone can create a home)'}`);
+  console.log(relayReady ? 'Relay: set up.' : 'Relay: not set up (visits connect directly only).');
+  // The host stops the old server on every deploy. End visits properly first,
+  // so no relay credentials are left working after it has gone.
+  process.once('SIGTERM', () => {
+    setTimeout(() => process.exit(0), 8000).unref();
+    close().finally(() => process.exit(0));
+  });
 }

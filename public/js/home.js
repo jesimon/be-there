@@ -2,7 +2,8 @@
 // Large, calm, and theirs to control: who may visit, whether anyone may come
 // straight in, pausing visits, and ending any visit with one tap. A red light
 // and their visitor's name show for the whole of every visit.
-import { $, el, initials, rememberedToken, forgetToken, connect, getCamera, stopStream, makePeer, unlockSound, chime } from './common.js';
+import { $, el, initials, rememberedToken, forgetToken, connect, getCamera, stopStream, unlockSound, chime } from './common.js';
+import { startCall } from './peer.js';
 
 const token = rememberedToken('home');
 let link;
@@ -12,6 +13,7 @@ let stream = null;
 let peer = null;
 let ringTimer = null;
 let countdownTimer = null;
+let noteTimer = null;
 
 function showProblem(title, text) {
   $('#problem-title').textContent = title;
@@ -70,8 +72,17 @@ $('#pause').addEventListener('click', () => {
   link.send({ type: 'pause', paused: !home.paused });
 });
 
+// A calm line under the status, shown for a minute and then taken away.
+function showNote(text) {
+  clearTimeout(noteTimer);
+  $('#note').textContent = text;
+  $('#note').hidden = !text;
+  if (text) noteTimer = setTimeout(() => showNote(''), 60_000);
+}
+
 // ----- Someone knocks -----
 function showKnock({ visitorId, name, mode, notice }) {
+  showNote('');
   call = { visitorId, name, state: 'ringing' };
   $('#knock-avatar').textContent = initials(name);
   $('#knock').hidden = false;
@@ -119,14 +130,34 @@ async function answer() {
   $('#with-you-text').textContent = `${name} is with you`;
   $('#call').hidden = false;
   $('#idle').hidden = true;
-  peer = await makePeer({
+  const mine = startCall({
+    role: 'home',
     stream,
-    offerer: false,
-    sendSignal: (data) => link.send({ type: 'signal', data }),
+    link,
     onRemote: (remote) => { const v = $('#remote'); if (v.srcObject !== remote) v.srcObject = remote; },
+    // The video never connected, or was lost for good: back to the clock,
+    // with a few plain words. Nothing else about the connection is shown here.
+    onState: (state) => { if (state === 'no_connection' && peer === mine) couldNotConnect(); },
   });
+  peer = mine;
+  try {
+    await mine.ready;
+  } catch (e) {
+    console.error(e);
+    if (peer !== mine) return;
+    link.send({ type: 'decline', visitorId });
+    endLocal();
+    return;
+  }
+  // The visit ended while the video link was being made ready.
+  if (peer !== mine) return;
   // Only now is the visitor told to start: the video link is ready for them.
   link.send({ type: 'answer', visitorId });
+}
+
+function couldNotConnect() {
+  endLocal();
+  showNote('The last visit couldn’t connect.');
 }
 
 function endLocal() {
@@ -163,10 +194,14 @@ function onMessage(msg) {
       if (!call) showKnock(msg);
       break;
     case 'signal':
-      peer?.handleSignal(msg.data).catch((e) => console.error(e));
+      peer?.handleSignal(msg.data);
+      break;
+    case 'relay':
+      peer?.handleRelay(msg);
       break;
     case 'ended':
-      endLocal();
+      if (msg.reason === 'no_connection') couldNotConnect();
+      else endLocal();
       break;
     default:
   }

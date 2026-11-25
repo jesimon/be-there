@@ -14,7 +14,18 @@ function offerShare(button, url, title) {
   button.onclick = () => navigator.share({ title, url }).catch(() => {});
 }
 
-function render(online) {
+// What the relay test found, in plain words.
+function relayResultText(res) {
+  if (res.ok) return 'The relay works.';
+  const reason = String(res.reason || '');
+  if (reason === 'not_set_up') return 'The relay is not set up yet, so there is nothing to test.';
+  if (/^http_(401|403|404)$/.test(reason)) return 'The relay service did not accept the key. Check TURN_KEY_ID and TURN_API_TOKEN.';
+  if (reason === 'timeout' || reason === 'network') return 'The relay service could not be reached. Try again in a moment.';
+  return 'The relay service gave an answer we did not expect. Try again in a moment.';
+}
+
+function render(online, relay) {
+  $('#relay-state').textContent = relay === 'ready' ? 'Relay: ready' : 'Relay: not set up (visits still work on most home networks)';
   $('#title').textContent = home.name;
   for (const n of document.querySelectorAll('.person-name-inline')) n.textContent = home.personName;
   $('#online').textContent = online ? 'Home screen is on' : 'Home screen is off: open its link on their tablet';
@@ -41,7 +52,7 @@ async function load() {
   try {
     const res = await call('/api/organize');
     home = res.home;
-    render(res.online);
+    render(res.online, res.relay);
   } catch (err) {
     $('#title').textContent = 'Be There';
     $('#error').textContent = err.message;
@@ -72,6 +83,18 @@ $('#hours').addEventListener('submit', async (e) => {
     await call('/api/organize/home', { method: 'PATCH', body: { hours: { start: f.get('start'), end: f.get('end') } } });
     load();
   } catch (err) { $('#error').textContent = err.message; }
+});
+
+$('#relay-test').addEventListener('click', async () => {
+  const button = $('#relay-test');
+  button.disabled = true;
+  $('#relay-result').textContent = 'Testing…';
+  try {
+    $('#relay-result').textContent = relayResultText(await call('/api/organize/relay-test', { method: 'POST' }));
+  } catch (err) {
+    $('#relay-result').textContent = err.message;
+  }
+  button.disabled = false;
 });
 
 $('#new-home-link').addEventListener('click', async () => {
