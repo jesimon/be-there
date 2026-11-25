@@ -87,15 +87,18 @@ h3 { margin: 0 0 0.3em; }
 
 /* Forms */
 .form { display: grid; gap: 14px; margin: 16px 0; }
-.form label { display: grid; gap: 4px; font-weight: 600; }
+.form label { display: grid; gap: 4px; font-weight: 600; min-width: 0; }
 .form input {
   font: inherit; padding: 0.6em 0.8em; border-radius: 12px;
   border: 2px solid var(--line); background: var(--surface); color: var(--ink); min-height: 48px; width: 100%;
+  min-width: 0; max-width: 100%;
 }
+/* iPhone browsers give time fields a wide minimum size; keep them in their box. */
+.form input[type=time] { -webkit-appearance: none; appearance: none; display: block; }
 .form input:focus { outline: 3px solid var(--green); outline-offset: 1px; }
 fieldset { border: 2px solid var(--line); border-radius: var(--radius); padding: 12px 14px; margin: 0; }
 legend { font-weight: 600; padding: 0 6px; }
-.row { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+.row { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 12px; }
 .inline-form { grid-template-columns: 1fr 1fr auto; align-items: end; }
 @media (max-width: 640px) { .inline-form { grid-template-columns: 1fr; } }
 
