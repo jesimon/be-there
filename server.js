@@ -40,7 +40,7 @@ function rateLimit(perMinute) {
   };
 }
 
-export function createApp({ store = createStore(), setupPassword = process.env.SETUP_PASSWORD || '' } = {}) {
+export function createApp({ store = createStore(), setupPassword = (process.env.SETUP_PASSWORD || '').trim() } = {}) {
   const app = express();
   app.set('trust proxy', 1);
   app.disable('x-powered-by');
@@ -66,7 +66,8 @@ export function createApp({ store = createStore(), setupPassword = process.env.S
   // ----- Setting up a home (needs SETUP_PASSWORD when it is set) -----
   app.post('/api/homes', rateLimit(5), (req, res) => {
     if (setupPassword) {
-      const given = String(req.body?.password || '');
+      // Trimmed, since a pasted password often carries a stray space.
+      const given = String(req.body?.password || '').trim();
       if (!sameHash(hashToken(given), hashToken(setupPassword))) return res.status(401).json({ error: 'That setup password is not right.' });
     }
     const { name, personName, timeZone, hours } = req.body || {};

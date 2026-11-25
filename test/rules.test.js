@@ -31,11 +31,13 @@ test('visiting hours use the home’s own time zone and can wrap past midnight',
   assert.equal(withinHours({ start: '20:00', end: '02:00' }, 'UTC', new Date('2026-11-25T23:30:00Z')), true);
   assert.equal(withinHours({ start: '20:00', end: '02:00' }, 'UTC', noon), false);
   assert.equal(withinHours({ start: '08:00', end: '21:00' }, 'Not/AZone', noon), true, 'a bad zone falls back to UTC');
+  // The same start and end means any time (a midnight-to-midnight setting).
+  for (const h of ['00:00', '03:15', '12:00', '23:59']) assert.equal(withinHours({ start: '00:00', end: '00:00' }, 'UTC', new Date(`2026-11-25T${h}:00Z`)), true);
 });
 
 test('bad hours and names are cleaned', () => {
   assert.deepEqual(cleanHours({ start: '25:00', end: '10:00' }), { start: '08:00', end: '21:00' });
-  assert.deepEqual(cleanHours({ start: '09:00', end: '09:00' }), { start: '08:00', end: '21:00' });
+  assert.deepEqual(cleanHours({ start: '00:00', end: '00:00' }), { start: '00:00', end: '00:00' });
   assert.equal(cleanName('  <b>Sarah</b>\n  Jones  '), 'bSarah/b Jones');
   assert.equal(cleanName('x'.repeat(100)).length, 60);
 });

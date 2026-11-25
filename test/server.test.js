@@ -62,7 +62,7 @@ test('pages are private and carry safe headers', async () => {
 test('a full visit: invite, consent, knock, answer, signals, end', async () => {
   // Setting up needs the password.
   assert.equal((await req('/api/homes', { method: 'POST', body: { personName: 'Mary' } })).status, 401);
-  const created = await req('/api/homes', { method: 'POST', body: { personName: 'Mary', password: 'open-sesame', hours: { start: '00:00', end: '23:59' } } });
+  const created = await req('/api/homes', { method: 'POST', body: { personName: 'Mary', password: ' open-sesame\n', hours: { start: '00:00', end: '23:59' } } });
   assert.equal(created.status, 201);
   const { homeToken, organizerToken } = created.body;
 
