@@ -30,7 +30,12 @@
           <h3>Send this link to <span id="new-name"></span></h3>
           <p>It is shown only once. They can visit after <span class="person-name-inline"></span> says yes on the home screen.</p>
           <code id="new-url"></code>
-          <button class="btn" type="button" data-copy="new-url">Copy</button>
+          <div class="link-actions">
+            <a id="new-open" class="btn yes" href="#" target="_blank" rel="noopener noreferrer">Open it on this phone</a>
+            <button id="new-share" class="btn" type="button" hidden>Share…</button>
+            <button class="btn" type="button" data-copy="new-url">Copy</button>
+          </div>
+          <p class="muted small">“Open it on this phone” is for when you are the visitor. Bookmark the page it opens.</p>
         </div>
       </section>
 
@@ -50,7 +55,14 @@
         <h2>Links</h2>
         <p>Lost the home screen link, or moving to a new tablet? Make a new one. The old screen stops working.</p>
         <button id="new-home-link" class="btn" type="button">New home screen link</button>
-        <div id="home-link-box" class="link-box" hidden><code id="home-url"></code><button class="btn" type="button" data-copy="home-url">Copy</button></div>
+        <div id="home-link-box" class="link-box" hidden>
+          <code id="home-url"></code>
+          <div class="link-actions">
+            <button id="home-share" class="btn yes" type="button" hidden>Share…</button>
+            <button class="btn" type="button" data-copy="home-url">Copy</button>
+          </div>
+          <p class="muted small">Open this on the tablet in their home, not on your phone.</p>
+        </div>
         <p>Make a new organizer link if this one may have been shared by mistake.</p>
         <button id="new-org-link" class="btn" type="button">New organizer link</button>
         <div id="org-link-box" class="link-box" hidden><code id="org-url"></code><button class="btn" type="button" data-copy="org-url">Copy</button></div>
