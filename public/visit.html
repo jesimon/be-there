@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="robots" content="noindex, nofollow">
+  <meta name="theme-color" content="#f7f3ec">
+  <title>Be There</title>
+  <link rel="stylesheet" href="/css/style.css">
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+</head>
+<body class="visit-screen">
+  <main id="lobby" class="page narrow">
+    <p class="brand">Be There</p>
+    <h1 id="title">Loading…</h1>
+    <p id="state" class="status-pill">Connecting…</p>
+    <p id="hint" class="muted"></p>
+    <video id="preview" class="preview" autoplay playsinline muted hidden></video>
+    <div class="actions">
+      <button id="visit" class="btn yes huge-btn" type="button" disabled>Visit now</button>
+      <button id="cancel" class="btn quiet" type="button" hidden>Cancel</button>
+    </div>
+    <p class="small muted">Nothing is recorded. They see when you are with them, and can end the visit at any time.</p>
+  </main>
+
+  <div id="call" class="call" hidden>
+    <video id="remote" autoplay playsinline></video>
+    <video id="local" autoplay playsinline muted></video>
+    <p class="with-you"><span class="live-dot" aria-hidden="true"></span><span id="with-text"></span></p>
+    <button id="end" class="btn no huge-btn end" type="button">Leave</button>
+  </div>
+
+  <script type="module" src="/js/visit.js"></script>
+</body>
+</html>
