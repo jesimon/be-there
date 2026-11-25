@@ -10,13 +10,9 @@
   <link rel="icon" href="/favicon.svg" type="image/svg+xml">
 </head>
 <body class="home-screen">
-  <!-- Browsers allow sound and the camera only after a first tap. -->
-  <div id="start" class="overlay start" hidden>
-    <div class="overlay-card">
-      <h1>Be There</h1>
-      <p class="big">Tap anywhere to begin.</p>
-    </div>
-  </div>
+  <!-- Browsers play sound only after a first tap. The screen is already
+       connected and visitors can knock; this only turns on the chime. -->
+  <button id="start" class="sound-banner" type="button" hidden>Tap anywhere to turn on the sound for visits</button>
 
   <div id="problem" class="overlay" hidden>
     <div class="overlay-card"><h1 id="problem-title">This screen needs its link</h1><p id="problem-text" class="big">Ask the family member who set it up to open the home screen link on this tablet.</p></div>

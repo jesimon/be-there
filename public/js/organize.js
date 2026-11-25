@@ -9,7 +9,7 @@ const call = (path, opts = {}) => api(path, { token, ...opts });
 function render(online) {
   $('#title').textContent = home.name;
   for (const n of document.querySelectorAll('.person-name-inline')) n.textContent = home.personName;
-  $('#online').textContent = online ? 'Home screen is on' : 'Home screen is off';
+  $('#online').textContent = online ? 'Home screen is on' : 'Home screen is off: open its link on their tablet';
   $('#online').className = `status-pill ${online ? 'open' : ''}`;
   $('#paused').hidden = !home.paused;
   $('#tz').textContent = home.timeZone;

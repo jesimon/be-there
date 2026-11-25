@@ -193,10 +193,11 @@ function start() {
   document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') wake(); });
 }
 
-// A first tap unlocks sound; then the screen is ready.
+// Connect straight away, so the screen is "on" as soon as it is opened.
+// The first tap anywhere turns on the chime (browsers require a tap for sound).
+start();
 $('#start').hidden = false;
-$('#start').addEventListener('click', () => {
+document.addEventListener('pointerdown', () => {
   unlockSound();
   $('#start').hidden = true;
-  start();
 }, { once: true });
