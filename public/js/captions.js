@@ -182,7 +182,8 @@ export function startCaptions({ remoteStream = null, audioContext = null, onUpda
   const scope = deps.scope || globalThis;
   const later = deps.setTimeout || ((fn, ms) => setTimeout(fn, ms));
   const cancel = deps.clearTimeout || ((id) => clearTimeout(id));
-  const now = deps.now || (() => performance.timeOrigin + performance.now());
+  // The same clock the worker reads (see `clock` in captions-worker.js).
+  const now = deps.now || (() => Date.now());
 
   let stopped = false;
   let state = '';

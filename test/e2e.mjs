@@ -954,15 +954,29 @@ try {
     assert.ok(full.lines[0].top < full.captions.top, 'the oldest words have left from the top');
     for (const other of ['toggle', 'end', 'label', 'self']) assert.equal(overlap(full.captions, full[other]), false, `full of words, the captions still do not cover ${other}`);
     await snapAll(home, '22c-home-captions-three-lines');
-    // A tablet held upright: still nothing on top of anything else.
-    await home.setViewportSize({ width: 810, height: 1080 });
-    const upright = await measure();
-    for (const [a, b] of [['captions', 'toggle'], ['captions', 'end'], ['captions', 'label'], ['captions', 'self'], ['toggle', 'end']]) assert.equal(overlap(upright[a], upright[b]), false, `upright: ${a} and ${b}`);
-    assert.equal(upright.toggle.height, upright.end.height);
-    await home.setViewportSize({ width: 1180, height: 820 });
+    // Other screens: tablets held upright (three sizes of iPad) and on their
+    // side, a small tablet, and a phone both ways. Nothing sits on top of
+    // anything else, everything is on the screen, and the switch keeps its
+    // words on one line, as tall as "End visit".
+    const fitsEveryScreen = async (what) => {
+      for (const [width, height] of [[810, 1080], [768, 1024], [744, 1133], [1024, 768], [600, 960], [390, 844], [844, 390], [667, 375]]) {
+        await home.setViewportSize({ width, height });
+        const at = await measure();
+        const where = `${what} at ${width}x${height}`;
+        for (const [a, b] of [['captions', 'toggle'], ['captions', 'end'], ['captions', 'label'], ['captions', 'self'], ['toggle', 'end'], ['toggle', 'self'], ['end', 'self'], ['label', 'toggle'], ['label', 'end']]) assert.equal(overlap(at[a], at[b]), false, `${where}: ${a} and ${b}`);
+        for (const part of ['captions', 'toggle', 'end', 'label']) assert.ok(at[part].left >= 0 && at[part].right <= at.screen.width && at[part].top >= 0 && at[part].bottom <= at.screen.height, `${where}: ${part} is on the screen`);
+        assert.equal(at.toggle.height, at.end.height, `${where}: the switch is as tall as “End visit”`);
+      }
+      await home.setViewportSize({ width: 1180, height: 820 });
+    };
+    await fitsEveryScreen('three lines of captions');
+    // Should the captions ever reach them all the same (a tablet set to very
+    // large letters, say), the name with its red light and the buttons are on top.
+    assert.deepEqual(await home.evaluate(() => ['#with-you', '.call-bar', '#captions'].map((selector) => getComputedStyle(document.querySelector(selector)).zIndex)), ['1', '1', 'auto']);
     // Fallen behind: the old words go, and a plain line says why.
     await pretend({ type: 'paused' });
     await boxSays('Captions paused, catching up');
+    await fitsEveryScreen('a line about captions');
     await snapAll(home, '22d-home-captions-paused');
     // Caught up: the line stays until there are words again.
     await pretend({ type: 'resumed' });
@@ -999,11 +1013,59 @@ try {
     await visit2.click('#end');
     await home.waitForSelector('#idle:not([hidden])');
     assert.equal(await boxIsEmpty(home), true);
-    await home.evaluate(() => { window.Worker = window.RealWorker; });
+    step('captions: “getting ready”, the notice, three lines at most, “paused”, “can’t keep up” and “aren’t available” each said in plain words; the visit went on every time; nothing covers anything on eight sizes of screen');
+
+    // A tablet that cannot bear captions may close the page outright while
+    // they are getting ready, and the visit with it. "On" is put aside until
+    // they are running, so that the next visit does not start them, and end,
+    // the same way. (The pretend worker never gets ready; reloading the page
+    // stands in for the tablet closing it, and brings the real worker back.)
+    assert.equal(await home.evaluate(() => localStorage.getItem('bethere.captions')), 'on');
+    await startVisit(visit2);
+    await Promise.all([hasVideo(home), hasVideo(visit2)]);
+    await boxSays('Getting captions ready…');
+    await toggleSays('Captions on', 'true');
+    assert.equal(await home.evaluate(() => localStorage.getItem('bethere.captions')), 'off', '“on” is put aside while captions get ready');
+    await home.reload();
+    await visit2.waitForSelector('#lobby:not([hidden])');
+    await home.click('#start');
+    await home.waitForSelector('.person');
+    const workersMade = () => home.evaluate(() => window.workersMade);
+    await home.evaluate(() => {
+      const Real = window.Worker;
+      window.workersMade = 0;
+      window.Worker = class extends Real { constructor(...args) { super(...args); if (args[0] !== 'http://[') window.workersMade += 1; } };
+    });
+    await startVisit(visit2);
+    await Promise.all([hasVideo(home), hasVideo(visit2)]);
+    await toggleSays('Captions off', 'false');
+    assert.equal(await boxIsEmpty(home), true);
+    await home.waitForTimeout(500);
+    assert.equal(await workersMade(), 0, 'captions did not start by themselves after the page died of them');
+    assert.equal(await home.evaluate(() => localStorage.getItem('bethere.captions')), 'off');
+    // A visit that ends in the ordinary way while captions are getting ready
+    // keeps the choice: the page is still standing.
+    await home.click('#captions-toggle');
+    await toggleSays('Captions on', 'true');
+    await home.click('#end');
+    await visit2.waitForSelector('#lobby:not([hidden])');
+    assert.equal(await workersMade(), 1);
+    assert.equal(await home.evaluate(() => localStorage.getItem('bethere.captions')), 'on');
+    await until(() => home.workers().length === 0, 'the captions worker to be ended');
+    // And when they do get ready, "on" is remembered from then on.
+    await startVisit(visit2);
+    await home.waitForSelector('#call:not([hidden])');
+    await toggleSays('Captions on', 'true');
+    await home.waitForFunction(() => document.querySelector('#captions.is-status')?.textContent === 'Captions are on. They can contain mistakes.' || document.querySelector('#captions:not(.is-status) p'), null, { timeout: 60_000 });
+    assert.equal(await home.evaluate(() => localStorage.getItem('bethere.captions')), 'on');
+    await visit2.click('#end');
+    await home.waitForSelector('#idle:not([hidden])');
+    await until(() => home.workers().length === 0, 'the captions worker to be ended');
+    assert.deepEqual(await home.evaluate(() => Object.keys(localStorage).sort()), ['bethere.captions', 'bethere.home'], 'still nothing kept but the switch and the screen’s own link');
     // All through, the home screen asked only this server for anything.
     // (A photo it already holds in memory is shown from a "blob:" address of its own.)
     assert.deepEqual(homeRequests.filter((request) => !request.url.startsWith(`${srv.url}/`) && !request.url.startsWith(`blob:${srv.url}/`)).map((request) => request.url), []);
-    step('captions: “getting ready”, the notice, three lines at most, “paused”, “can’t keep up” and “aren’t available” each said in plain words; the visit went on every time');
+    step('captions: a page that closes while they get ready does not start them by itself next time; a visit that ends in the ordinary way keeps the choice');
 
     // ----- The captions check page -----
     // What a family opens on the tablet before relying on captions. Here on
@@ -1043,6 +1105,28 @@ try {
     const line = (start) => numbers.split('\n').find((text) => text.startsWith(start));
     step(`the captions check page: ${line('Quick test')}; ${line('Words after speech')}; ${line('Behind the sound')}; no pauses`);
     await checkCtx.close();
+
+    // A browser that cannot make the sound link from the page to itself: the
+    // long test says so, and that this says nothing about captions in a
+    // visit. It is not counted as captions failing, and can be tried again.
+    const noLinkCtx = await browser.newContext({ viewport: { width: 390, height: 844 } });
+    await noLinkCtx.addInitScript(() => { RTCPeerConnection.prototype.addIceCandidate = async () => {}; });
+    const noLink = await noLinkCtx.newPage();
+    await noLink.goto(`${srv.url}/captions-check?seconds=5`);
+    await noLink.waitForFunction(() => !document.querySelector('#step1').disabled);
+    await noLink.click('#step1');
+    await noLink.waitForFunction(() => /^Ready\.|could not/.test(document.querySelector('#result1').textContent), null, { timeout: 60_000 });
+    await noLink.click('#step3');
+    await noLink.waitForFunction(() => /^Done\.|No words|stopped|could not/.test(document.querySelector('#result3').textContent), null, { timeout: 40_000 });
+    assert.equal(await noLink.textContent('#result3'), 'The two-minute test could not be run: this page could not make a sound link to itself. That says nothing about captions in a visit.');
+    assert.equal(await noLink.textContent('#verdict'), 'Not tried yet.');
+    assert.match(await noLink.textContent('#numbers'), /\nLong test not run: this page could not make a sound link to itself\.\n/);
+    assert.equal(await noLink.isDisabled('#step1'), false);
+    assert.equal(await noLink.isDisabled('#step3'), false);
+    assert.equal(noLink.workers().length, 0);
+    assert.equal(await boxIsEmpty(noLink), true);
+    step('the captions check page: when the page cannot link to itself, it says the long test was not run, and blames nothing on captions');
+    await noLinkCtx.close();
   }
 
   // ----- The new address -----

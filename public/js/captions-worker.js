@@ -30,7 +30,13 @@ const filesAt = `${origin}${FILES.base}`;
 // The device's own store for the files, named after their version. Only the
 // model and what runs it ever go in it.
 const KEPT = `bethere-captions-${FILES.base.split('/').filter(Boolean).pop()}`;
-const clock = () => performance.timeOrigin + performance.now();
+// The time now, on the one clock the page and this worker both read: the page
+// stamps each block of sound with it (captions.js), and how far behind we are
+// is the difference. (Each has a finer clock of its own, but those start
+// afresh for every page and worker and need not agree: after days of a home
+// screen being open, a worker made today could take every block for seconds
+// old, or never see that it had fallen behind.)
+const clock = () => Date.now();
 // The one way anything leaves this worker: a message to the page that made it.
 const tell = (message) => self.postMessage(message);
 

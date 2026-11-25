@@ -506,6 +506,62 @@ test('the worker by itself, as the check page uses it', async () => {
 // Whether, and where
 // ---------------------------------------------------------------------------
 
+test('the home screen: “on” is put aside while captions get ready, so a page that dies of them does not start them again', () => {
+  // A tablet that cannot bear the speech model may close the page (and the
+  // visit) with no warning. With "on" still remembered, every later visit
+  // would start captions by itself and end the same way. So the tablet
+  // remembers "off" from the moment captions start until they are running,
+  // or have stopped with the page still standing; then "on" again.
+  const home = read('js/home.js');
+  const starting = home.slice(home.indexOf('function captionsOn() {'), home.indexOf('function captionsOff() {'));
+  assert.ok(starting.length > 500);
+  // Put aside before anything is started…
+  assert.ok(starting.indexOf('captionsKit.rememberCaptions(false);') > 0);
+  assert.ok(starting.indexOf('captionsKit.rememberCaptions(false);') < starting.indexOf('captionsKit.startCaptions('), 'before the worker is made');
+  // …and back the first time captions say anything but "getting ready": they are running, or have stopped themselves.
+  assert.match(starting, /onStatus: during\(\(state, info\) => \{\n\s+if \(state !== 'loading' && captionView\.state === 'loading'\) captionsKit\.rememberCaptions\(true\);\n\s+captionView = \{ \.\.\.captionView, state, percent: info\?\.percent \};/);
+  assert.match(starting, /\} catch \{\n\s+captions = null;\n\s+captionView = \{ state: 'off', lines: \[\] \};\n\s+captionsKit\.rememberCaptions\(true\);\n\s+\}/, 'could not even be started: the page is standing');
+  // A visit that ends while captions are on or getting ready: "on" again. (Switched off by hand, `captions` is empty by then, and "off" stays.)
+  assert.match(home, /if \(captions\) captionsKit\?\.rememberCaptions\(true\);\n\s+captionsOff\(\);/);
+  assert.doesNotMatch(home.slice(home.indexOf('function captionsOff() {'), home.indexOf('// The visit is over')), /rememberCaptions/, 'switching off by hand writes nothing but the tap’s own “off”');
+  // Those are all the places the choice is written: the tap, aside, back (three ways).
+  assert.equal(home.match(/rememberCaptions\(/g).length, 5);
+  assert.deepEqual(home.match(/rememberCaptions\([^)]*\)/g).sort(), ['rememberCaptions(false)', 'rememberCaptions(on)', 'rememberCaptions(true)', 'rememberCaptions(true)', 'rememberCaptions(true)']);
+});
+
+test('the home screen: the words never leave the part of its script that shows them', () => {
+  const home = read('js/home.js');
+  const start = home.indexOf('// ----- Captions (a trial) -----');
+  const end = home.indexOf('// ----- Someone knocks -----');
+  assert.ok(start > 0 && end > start + 2000);
+  const code = (text) => text.split('\n').filter((line) => !line.trim().startsWith('//')).join('\n');
+  // That part asks the server one thing, by the clock (are captions ready), and has no other way to send or keep anything.
+  const captionsPart = code(home.slice(start, end));
+  assert.deepEqual(captionsPart.match(/link\b|\.send\(|fetch\(|api\(|XMLHttpRequest|WebSocket|sendBeacon|localStorage|sessionStorage|indexedDB|console\.|postMessage|location|\.href\b|cookie/g), ['api('], 'the one question: /api/config');
+  assert.match(captionsPart, /\(tries \? api\('\/api\/config'\) : getConfig\(\)\)\.then\(/);
+  // The words are held in captionView and in the lines handed to onUpdate. Nothing outside that part of the file touches either, or the box.
+  const rest = code(home.slice(0, start) + home.slice(end));
+  assert.doesNotMatch(rest, /captionView|captionLineTimer|\blines\b|showCaptions|'#captions'/);
+  assert.match(captionsPart, /onUpdate: during\(\(lines\) => \{ captionView = \{ \.\.\.captionView, lines \}; drawCaptions\(\); \}\),/);
+});
+
+test('how far behind: the page and its worker read one and the same clock', () => {
+  // The page stamps each block of sound, and the worker takes the difference
+  // from its own "now" as how far behind it is. That only works if both read
+  // one clock. Each also has a finer clock of its own (performance.now()),
+  // which starts afresh for every page and worker: between a home screen
+  // that has been open for days and a worker made a moment ago the two need
+  // not agree, and captions would stop as "can’t keep up", or never notice
+  // that they were behind.
+  const pageSide = read('js/captions.js');
+  const worker = read('js/captions-worker.js');
+  assert.match(pageSide, /\n {2}const now = deps\.now \|\| \(\(\) => Date\.now\(\)\);\n/);
+  assert.match(worker, /\nconst clock = \(\) => Date\.now\(\);\n/);
+  assert.match(pageSide, /engine\.send\(\{ type: 'audio', samples: block\.samples, rate: block\.rate, t: now\(\) \}/);
+  assert.match(worker, /createCaptioner\(\{ speechProbability, write, resetDetector: newDetectorState, tell, clock \}\)/);
+  for (const file of ['js/captions.js', 'js/captions-worker.js', 'js/caption-text.js']) assert.doesNotMatch(read(file), /timeOrigin/, file);
+});
+
 test('the choice is remembered as “on” or “off” under one name, and nothing else is', () => {
   assert.equal(CAPTIONS_KEY, 'bethere.captions');
   const kept = new Map();
@@ -720,12 +776,16 @@ test('the home screen: captions are switched by the person at home, asked about 
   const duringVisits = home.slice(home.indexOf('// ----- Someone knocks -----'), home.indexOf('// ----- Messages from the server -----'));
   assert.ok(duringVisits.length > 1000);
   assert.doesNotMatch(duringVisits, /learnCaptions|getConfig|api\(|fetch\(|import\(/, 'nothing between a knock and the end of a visit asks the server about captions');
-  // Only a tap by the person at home changes the remembered choice.
-  assert.equal(home.match(/rememberCaptions\(/g).length, 1);
+  // Only a tap by the person at home changes what they chose…
   assert.match(home, /\$\('#captions-toggle'\)\.addEventListener\('click', \(\) => \{\n\s+if \(!captionsKit\) return;\n\s+const on = !captions;\n\s+captionsKit\.rememberCaptions\(on\);/);
+  // …and captions start by themselves only when "on" is what is remembered: off until then.
+  assert.match(home, /\n {2}if \(!captions && captionsKit\.captionsRemembered\(\)\) captionsOn\(\);\n/);
+  assert.equal(home.match(/captionsOn\(/g).length, 3, 'defined, started by the remembered choice, started by the switch');
   // Every way a visit ends goes through endLocal, which ends captions first.
   assert.match(home, /function endLocal\(\) \{\n\s+hideKnock\(\);\n\s+try \{ endCaptions\(\); \}/);
-  assert.match(home, /function endCaptions\(\) \{\n\s+captionsOff\(\);\n\s+\$\('#captions-toggle'\)\.hidden = true;/);
+  assert.match(home, /function endCaptions\(\) \{\n(?:\s+\/\/.*\n)*\s+if \(captions\) captionsKit\?\.rememberCaptions\(true\);\n\s+captionsOff\(\);\n\s+\$\('#captions-toggle'\)\.hidden = true;/);
+  // Any tap wakes the sound, whichever end of the tap the browser counts.
+  assert.match(home, /for \(const tap of \['pointerdown', 'click'\]\) document\.addEventListener\(tap, \(\) => \{ try \{ captions\?\.nudge\(\); \}/);
   // No line of the home screen's script has both captions and a way to send or store.
   for (const line of home.split('\n')) {
     if (/caption/i.test(line) && !line.trim().startsWith('//')) assert.doesNotMatch(line, /link\.|\.send\(|fetch\(|api\(|localStorage|sessionStorage|console\./, line.trim());

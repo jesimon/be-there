@@ -172,6 +172,13 @@ function captionsOn() {
   if (captions || !captionsKit) return;
   clearTimeout(captionLineTimer);
   captionView = { state: 'loading', lines: [] };
+  // A tablet that cannot bear the speech model may close this page outright,
+  // and the visit with it, with no chance to say so. If "on" were still
+  // remembered then, the next visit would start captions by itself and end
+  // the same way, every time. So "on" is put aside while captions get ready,
+  // and written back once they are running, or have stopped with the page
+  // still standing.
+  captionsKit.rememberCaptions(false);
   let mine = null;
   const during = (fn) => (...args) => { if (mine && captions === mine) fn(...args); };
   try {
@@ -181,6 +188,7 @@ function captionsOn() {
       codeAt: captionsCodeAt,
       onUpdate: during((lines) => { captionView = { ...captionView, lines }; drawCaptions(); }),
       onStatus: during((state, info) => {
+        if (state !== 'loading' && captionView.state === 'loading') captionsKit.rememberCaptions(true);
         captionView = { ...captionView, state, percent: info?.percent };
         // Captions could not run, or could not keep up: they have stopped
         // themselves. The switch goes off, and a plain line says why for a
@@ -196,6 +204,7 @@ function captionsOn() {
   } catch {
     captions = null;
     captionView = { state: 'off', lines: [] };
+    captionsKit.rememberCaptions(true);
   }
 }
 
@@ -209,6 +218,9 @@ function captionsOff() {
 
 // The visit is over: stop listening, end the worker, take the words away.
 function endCaptions() {
+  // Captions that were on, or still getting ready, when the visit ended:
+  // "on" is what they chose, and the page is still standing.
+  if (captions) captionsKit?.rememberCaptions(true);
   captionsOff();
   $('#captions-toggle').hidden = true;
   drawCaptions();
@@ -222,7 +234,8 @@ $('#captions-toggle').addEventListener('click', () => {
   drawCaptions();
 });
 // Some browsers let a page listen to sound only after a tap: any tap will do.
-document.addEventListener('pointerdown', () => { try { captions?.nudge(); } catch { /* not listening */ } });
+// (Both ends of it: for a finger on glass, some count only the lifting.)
+for (const tap of ['pointerdown', 'click']) document.addEventListener(tap, () => { try { captions?.nudge(); } catch { /* not listening */ } });
 
 // ----- Someone knocks -----
 function showKnock({ visitorId, name, mode, notice }) {

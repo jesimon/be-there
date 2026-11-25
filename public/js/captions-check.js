@@ -39,6 +39,7 @@ function showAnswer() {
       `Behind the sound: usually ${secs(found.long.lag.typical)} s, at worst ${secs(found.long.lag.worst)} s`,
       `Sound: ${found.long.rate} Hz, ${found.long.heard.blocks} blocks heard, loudest ${found.long.heard.loudest}`);
   }
+  if (found.untried) lines.push(`Long test not run: ${found.untried}`);
   if (found.error) lines.push(`Went wrong: ${found.error}`);
   lines.push(`Browser: ${navigator.userAgent}`);
   $('#numbers').textContent = lines.join('\n');
@@ -140,11 +141,31 @@ async function longTest() {
   let lock = null;
   const outcome = { stopped: '' };
   let result = ['The two-minute test could not be run.', true];
+  delete found.untried;
+  // A fault of this test itself, which says nothing about captions in a visit.
+  const untried = (why) => Object.assign(new Error(why), { untried: true });
+  const pause = (ms) => new Promise((resolve) => { setTimeout(resolve, ms); });
+  // Some devices let a page start sound only from inside a tap, and this is
+  // the tap: so both things that make sound here are started now, before
+  // anything is waited for. Any later tap tries again.
+  const remote = new MediaStream();
+  const wake = () => {
+    try { Promise.resolve(context?.resume()).catch(() => {}); } catch { /* still asleep */ }
+    try { Promise.resolve($('#loop').play()).catch(() => {}); } catch { /* still waiting */ }
+    try { run?.nudge(); } catch { /* not listening */ }
+  };
+  try {
+    context = new (window.AudioContext || window.webkitAudioContext)();
+    $('#loop').srcObject = remote;
+  } catch { /* said below */ }
+  wake();
+  for (const tap of ['pointerdown', 'click']) document.addEventListener(tap, wake);
   try {
     say('#result3', 'Starting…');
     const { rate, samples } = await loadSample();
-    context = new (window.AudioContext || window.webkitAudioContext)();
-    await context.resume();
+    if (!context) throw untried('this browser has no way to play the sample.');
+    for (let waited = 0; waited < 3000 && context.state !== 'running'; waited += 100) await pause(100);
+    if (context.state !== 'running') throw untried('the sound could not be started. Please press the button again.');
     lock = await navigator.wakeLock?.request('screen').catch(() => null);
     const buffer = context.createBuffer(1, samples.length, rate);
     buffer.getChannelData(0).set(samples);
@@ -158,7 +179,6 @@ async function longTest() {
     receiver = new RTCPeerConnection();
     sender.onicecandidate = (e) => { if (e.candidate) receiver.addIceCandidate(e.candidate).catch(() => {}); };
     receiver.onicecandidate = (e) => { if (e.candidate) sender.addIceCandidate(e.candidate).catch(() => {}); };
-    const remote = new MediaStream();
     const arrived = new Promise((resolve) => { receiver.ontrack = (e) => { remote.addTrack(e.track); resolve(); }; });
     for (const track of out.stream.getAudioTracks()) sender.addTrack(track, out.stream);
     await sender.setLocalDescription(await sender.createOffer());
@@ -168,9 +188,14 @@ async function longTest() {
     await arrived;
     // Played out loud, as a visitor's voice is: a browser gives a page no
     // sound to listen to from a link it is not playing.
-    $('#loop').srcObject = remote;
-    await $('#loop').play().catch(() => {});
+    if ($('#loop').srcObject !== remote) $('#loop').srcObject = remote;
+    wake();
     player.start();
+    // The link from this page to itself has to be up before anything can be
+    // heard through it. If it never comes up, captions were never tried.
+    const linked = () => ['connected', 'completed'].includes(receiver.iceConnectionState);
+    for (let waited = 0; waited < 10_000 && !linked(); waited += 200) await pause(200);
+    if (!linked()) throw untried('this page could not make a sound link to itself.');
 
     draw();
     const ended = new Promise((resolve) => {
@@ -196,8 +221,14 @@ async function longTest() {
       : numbers.captions === 0 ? `No words appeared. ${numbers.heard.loudest < 0.005 ? 'This browser gave captions no sound to listen to.' : 'The speech was heard, but no words came of it.'}`
       : `Done. Words appeared about ${secs(numbers.delay.typical)} seconds after they were spoken (${secs(numbers.delay.worst)} at worst). Captions ran ${secs(numbers.lag.typical)} seconds behind the sound (${secs(numbers.lag.worst)} at worst), and ${numbers.pauses === 0 ? 'never had to pause to catch up' : numbers.pauses === 1 ? 'paused to catch up once' : `paused to catch up ${numbers.pauses} times`}.`, !!outcome.stopped || numbers.captions === 0];
   } catch (err) {
-    found.error = err.message;
+    if (err.untried) {
+      found.untried = err.message;
+      result = [`The two-minute test could not be run: ${err.message} That says nothing about captions in a visit.`, true];
+    } else {
+      found.error = err.message;
+    }
   }
+  for (const tap of ['pointerdown', 'click']) document.removeEventListener(tap, wake);
   try { run?.stop(); } catch { /* already stopped */ }
   try { player?.stop(); } catch { /* never started */ }
   sender?.close();
